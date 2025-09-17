@@ -7,6 +7,9 @@ import numpy as np
 import pandas as pd
 from sklearn.decomposition import TruncatedSVD
 from sklearn.linear_model import LogisticRegression
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import json
 import logging, traceback
 logger = logging.getLogger("uvicorn.error")
 
@@ -61,7 +64,8 @@ def recommend_ucb(user: str, k: int):
         mean = (1+s)/(2+c)
         bonus = np.sqrt(2*np.log(1+g["count"].sum()+1) / (1+c))
         scores[t] = mean + 0.2*bonus
-    ranked = sorted(TOPICS, key=lambda x: scores[x])
+    # Sort descending by score (higher is better)
+    ranked = sorted(TOPICS, key=lambda x: scores[x], reverse=True)
     return ranked[:k]
 
 
@@ -107,8 +111,47 @@ def init_db():
             UNIQUE(paper_id, qno)
         )
     """)
+    # A/B logging table: stores which policy was served and timestamp
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ab_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id TEXT,
+            policy TEXT,
+            k INTEGER,
+            payload TEXT,
+            ts TEXT
+        )
+    """)
     conn.commit(); conn.close()
 init_db()
+
+
+def build_tfidf_questions():
+    """Build and cache TF-IDF matrix for all questions (text_snippet).
+    Stores vectorizer and matrix in MODELS['tfidf'].
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT id, topic, text_snippet FROM questions")
+    rows = cur.fetchall()
+    conn.close()
+    if not rows:
+        MODELS['tfidf'] = None
+        return
+    ids, topics, texts = zip(*rows)
+    texts = [t if t is not None else "" for t in texts]
+    vec = TfidfVectorizer(max_features=4096)
+    X = vec.fit_transform(texts)
+    MODELS['tfidf'] = {"vectorizer": vec, "X": X, "ids": list(ids), "topics": list(topics)}
+
+
+def ensure_tfidf():
+    if MODELS.get('tfidf') is None:
+        try:
+            build_tfidf_questions()
+        except Exception:
+            MODELS['tfidf'] = None
+
 
 app = FastAPI(title="Adaptive Quiz API", version="0.3.0")
 app.add_middleware(
@@ -413,6 +456,112 @@ def get_recommendation(student_id: str, k: int = 3, policy: str = "baseline"):
         topics = (topics + [t for t in cand if t not in topics])[:k]
 
     return RecommendationOut(policy=policy, student_id=student_id, next_topics=topics)
+
+
+@app.get("/recommend_questions")
+def get_recommend_questions(student_id: str, k: int = 5, policy: str = "baseline"):
+    """Return up to k question rows mapped from topic recommendations.
+    Strategy: get topic ranking from chosen policy, then for each topic
+    fetch candidate questions ordered by most recent insertion (q.id desc) and
+    fill until k results. Falls back to random questions if DB is empty.
+    """
+    # Reuse the existing recommendation logic to get topic ranking
+    rec = get_recommendation(student_id=student_id, k=len(TOPICS), policy=policy)
+    topics = rec.next_topics
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    ensure_tfidf()
+    tf = MODELS.get('tfidf')
+
+    out = []
+    # If TF-IDF is available and student has history snippets, build a profile
+    student_profile_vec = None
+    try:
+        if tf is not None:
+            # collect student's attempted question snippets (if any)
+            cur.execute("SELECT q.text_snippet FROM attempts a JOIN questions q ON a.topic = q.topic WHERE a.student_id = ?", (student_id,))
+            hist_texts = [r[0] for r in cur.fetchall() if r[0]]
+            if hist_texts:
+                vec = tf['vectorizer']
+                T = vec.transform(hist_texts)
+                student_profile_vec = T.mean(axis=0)
+    except Exception:
+        student_profile_vec = None
+
+    if student_profile_vec is not None:
+        # Rank all questions by cosine similarity to student profile
+        X = MODELS['tfidf']['X']
+        sims = cosine_similarity(student_profile_vec, X).flatten()
+        idxs = sims.argsort()[::-1]
+        for idx in idxs:
+            if len(out) >= k:
+                break
+            qid = MODELS['tfidf']['ids'][idx]
+            cur.execute("SELECT q.*, p.pdf_url FROM questions q JOIN papers p ON q.paper_id = p.id WHERE q.id = ?", (qid,))
+            r = cur.fetchone()
+            if not r: continue
+            out.append({
+                "question_id": r["id"],
+                "paper_id": r["paper_id"],
+                "qno": r["qno"],
+                "topic": r["topic"],
+                "difficulty": r["difficulty"],
+                "page_start": r["page_start"],
+                "page_end": r["page_end"],
+                "open_url": f"{r['pdf_url']}#page={r['page_start']}",
+                "text_snippet": r.get("text_snippet") if "text_snippet" in r.keys() else None,
+            })
+    else:
+        # Fallback: topic mapping (as before)
+        for t in topics:
+            if len(out) >= k:
+                break
+            # Prefer questions with the topic, newest first
+            cur.execute("SELECT q.*, p.pdf_url FROM questions q JOIN papers p ON q.paper_id = p.id WHERE q.topic = ? ORDER BY q.id DESC", (t,))
+            rows = cur.fetchall()
+            for r in rows:
+                if len(out) >= k:
+                    break
+                rec_item = {
+                    "question_id": r["id"],
+                    "paper_id": r["paper_id"],
+                    "qno": r["qno"],
+                    "topic": r["topic"],
+                    "difficulty": r["difficulty"],
+                    "page_start": r["page_start"],
+                    "page_end": r["page_end"],
+                    "open_url": f"{r['pdf_url']}#page={r['page_start']}",
+                    "text_snippet": r.get("text_snippet") if "text_snippet" in r.keys() else None,
+                }
+                out.append(rec_item)
+    # If still short, pad with random questions
+    if len(out) < k:
+        cur.execute("SELECT q.*, p.pdf_url FROM questions q JOIN papers p ON q.paper_id = p.id ORDER BY RANDOM() LIMIT ?", (k - len(out),))
+        for r in cur.fetchall():
+            out.append({
+                "question_id": r["id"],
+                "paper_id": r["paper_id"],
+                "qno": r["qno"],
+                "topic": r["topic"],
+                "difficulty": r["difficulty"],
+                "page_start": r["page_start"],
+                "page_end": r["page_end"],
+                "open_url": f"{r['pdf_url']}#page={r['page_start']}",
+                "text_snippet": r.get("text_snippet") if "text_snippet" in r.keys() else None,
+            })
+    # Log A/B entry
+    try:
+        payload = json.dumps({"k": k, "policy": policy, "topic_order": topics[:10]})
+        cur.execute("INSERT INTO ab_log(student_id, policy, k, payload, ts) VALUES (?,?,?,?,?)",
+                    (student_id, policy, int(k), payload, datetime.datetime.utcnow().isoformat()))
+        conn.commit()
+    except Exception:
+        pass
+    conn.close()
+    return {"student_id": student_id, "policy": policy, "questions": out[:k]}
 
 
 @app.post("/train")
