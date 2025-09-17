@@ -7,12 +7,46 @@ import numpy as np
 import pandas as pd
 from sklearn.decomposition import TruncatedSVD
 from sklearn.linear_model import LogisticRegression
+import logging, traceback
+logger = logging.getLogger("uvicorn.error")
+
 
 DB_PATH = "app.db"
 TOPICS = [
     "Number","Algebra","Ratio & Proportion","Geometry","Trigonometry","Probability",
     "Statistics","Sequences","Graphs","Transformations","Vectors","Equations","Inequalities","Functions"
 ]
+
+def active_topics():
+    """
+    Topics that exist in the current dataset/models.
+    Prefer model topics if trained; otherwise read from DB; otherwise use the full TOPICS constant.
+    """
+    try:
+        # If CF is trained, its recon_df columns are the trained topic set
+        cf = MODELS.get("cf")
+        if cf and isinstance(cf.get("recon", None), pd.DataFrame):
+            cols = list(cf["recon"].columns)
+            if cols: return cols
+        # If LR is trained, its topic_index keys form the set
+        lr = MODELS.get("lr")
+        if lr and lr.get("topic_index"):
+            keys = list(lr["topic_index"].keys())
+            if keys: return keys
+    except Exception:
+        pass
+
+    # Fallback: read from attempts table
+    try:
+        df = load_df()
+        if not df.empty:
+            return sorted(df["topic"].unique().tolist())
+    except Exception:
+        pass
+
+    # Last resort: full constant
+    return TOPICS
+
 
 def recommend_ucb(user: str, k: int):
     # per-topic Beta(1+success, 1+fail) from this student's history
@@ -101,7 +135,7 @@ def health():
 
 @app.get("/topics")
 def get_topics():
-    return [{"topic": t} for t in TOPICS]
+    return [{"topic": t} for t in active_topics()]
 
 # ---------- Papers & Questions endpoints ----------
 def _get_paper_url(paper_id: int) -> str:
@@ -132,7 +166,7 @@ def list_questions(paper_id: int = Query(..., description="papers.id to fetch"))
         r["open_url"] = f"{base}#page={r['page_start']}"
     return out
 
-# ---------- Attempts & Recommenders (your existing logic) ----------
+# ---------- Attempts & Recommenders  ----------
 @app.post("/attempt")
 def post_attempt(a: AttemptIn):
     if a.topic not in TOPICS:
@@ -194,51 +228,106 @@ def train_models():
 
 def topic_days_since(user: str):
     df = load_df()
-    out = {t: 60 for t in TOPICS}
-    if df.empty: return out
+    cand = active_topics()
+    out = {t: 60 for t in cand}
+    if df.empty:
+        return out
     dfu = df[df["student_id"] == user]
-    if dfu.empty: return out
+    if dfu.empty:
+        return out
     last = dfu.groupby("topic")["ts"].max().to_dict()
     now = pd.Timestamp.utcnow()
-    for t in TOPICS:
+    for t in cand:
         if t in last:
             out[t] = int((now - last[t]).days)
     return out
 
+
 def recommend_cf(user: str, k: int):
     m = MODELS.get("cf")
-    if not m: return random.sample(TOPICS, k=min(k,len(TOPICS)))
+    cand = active_topics()
+    if not m:
+        return random.sample(cand, k=min(k, len(cand)))
     recon_df, topic_means = m["recon"], m["topic_means"]
-    probs = recon_df.loc[user].to_dict() if (user in recon_df.index) else {t: float(topic_means.get(t, 0.6)) for t in TOPICS}
+    if user in recon_df.index:
+        probs = recon_df.loc[user].to_dict()
+    else:
+        probs = {t: float(topic_means.get(t, 0.6)) for t in cand}
     days = topic_days_since(user)
-    scored = sorted(TOPICS, key=lambda t: (1.0 - probs.get(t, 0.6)) + 0.002*days[t], reverse=True)
+    scored = sorted(cand, key=lambda t: (1.0 - probs.get(t, 0.6)) + 0.002*days.get(t,60), reverse=True)
     return scored[:k]
+
 
 def recommend_lr(user: str, k: int, difficulty: int = 2):
     m = MODELS.get("lr")
-    if not m: return random.sample(TOPICS, k=min(k,len(TOPICS)))
+    cand = active_topics()
+    if not m:
+        return random.sample(cand, k=min(k, len(cand)))
     lr = m["model"]; topics_n = m["topics_n"]; topic_index = m["topic_index"]
     df = load_df()
     prev = df[df["student_id"] == user].groupby("topic")["correct"].mean().to_dict()
     days = topic_days_since(user)
     rows = []
-    for t in TOPICS:
-        pm = prev.get(t, 0.5); ds = days.get(t, 60)
+    for t in cand:
+        pm = prev.get(t, 0.5)
+        ds = days.get(t, 60)
         xnum = np.array([pm, float(difficulty), float(ds)], dtype=float)
-        oh = np.zeros(topics_n); idx = topic_index.get(t, None)
-        if idx is not None: oh[idx] = 1.0
+        oh = np.zeros(topics_n)
+        idx = topic_index.get(t, None)
+        if idx is not None:
+            oh[idx] = 1.0
         rows.append((t, np.concatenate([xnum, oh])))
     X = np.vstack([r[1] for r in rows])
     probs = lr.predict_proba(X)[:,1]
     topic_prob = {rows[i][0]: float(probs[i]) for i in range(len(rows))}
-    scored = sorted(TOPICS, key=lambda t: (1.0 - topic_prob[t]) + 0.002*days[t], reverse=True)
+    scored = sorted(cand, key=lambda t: (1.0 - topic_prob[t]) + 0.002*days.get(t,60), reverse=True)
     return scored[:k]
+
 
 def recommend_hybrid(user: str, k: int):
     a = recommend_cf(user, len(TOPICS)); b = recommend_lr(user, len(TOPICS))
     rank_a = {t:i for i,t in enumerate(a)}; rank_b = {t:i for i,t in enumerate(b)}
     scored = sorted(TOPICS, key=lambda t: -(1.0/(1+rank_a.get(t,99)) + 1.0/(1+rank_b.get(t,99))))
     return scored[:k]
+
+def safe_cf(user: str, k: int):
+    try:
+        out = recommend_cf(user, k)
+        if not out: out = random.sample(TOPICS, k=min(k, len(TOPICS)))
+        return [t for t in out if t in TOPICS][:k]
+    except Exception:
+        logger.exception("CF recommendation failed.")
+        return random.sample(TOPICS, k=min(k, len(TOPICS)))
+
+def safe_lr(user: str, k: int):
+    try:
+        out = recommend_lr(user, k)
+        if not out: out = random.sample(TOPICS, k=min(k, len(TOPICS)))
+        return [t for t in out if t in TOPICS][:k]
+    except Exception:
+        logger.exception("LogReg recommendation failed.")
+        return random.sample(TOPICS, k=min(k, len(TOPICS)))
+
+def safe_hybrid(user: str, k: int):
+    try:
+        a = recommend_cf(user, len(TOPICS)) or []
+        b = recommend_lr(user, len(TOPICS)) or []
+        if not a and not b:
+            return random.sample(TOPICS, k=min(k, len(TOPICS)))
+        if not a: return b[:k]
+        if not b: return a[:k]
+        rank_a = {t:i for i,t in enumerate(a)}
+        rank_b = {t:i for i,t in enumerate(b)}
+        scored = sorted(TOPICS, key=lambda t: -(1/(1+rank_a.get(t,99)) + 1/(1+rank_b.get(t,99))))
+        out = [t for t in scored if t in TOPICS][:k]
+        if len(out) < k:
+            pad = [t for t in TOPICS if t not in out]
+            out = (out + pad)[:k]
+        return out
+    except Exception:
+        logger.exception("Hybrid recommendation failed; falling back to CF.")
+        return safe_cf(user, k)
+
 
 MODELS = {"cf": None, "lr": None, "dirty": True, "meta": {}}
 def ensure_models():
@@ -248,24 +337,46 @@ def ensure_models():
 @app.get("/recommendation", response_model=RecommendationOut)
 def get_recommendation(student_id: str, k: int = 3, policy: str = "baseline"):
     policy = policy.lower().strip()
-    if policy in ("cf","logreg","hybrid"): ensure_models()
-    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
-    cur.execute("""
-        SELECT topic, difficulty, correct, ts
-        FROM attempts
-        WHERE student_id = ?
-        ORDER BY ts ASC
-    """, (student_id,)); rows = cur.fetchall(); conn.close()
 
+    # If a model policy is requested, ensure models exist
+    if policy in ("cf", "logreg", "hybrid"):
+        try:
+            ensure_models()
+        except Exception:
+            logger.exception("ensure_models() failed; downgrading to baseline.")
+            policy = "baseline"
+
+    # Active topic universe (ALWAYS define this before using)
+    cand = active_topics()
+    if not cand:
+        cand = TOPICS
+
+    # Fetch student's history (safe)
+    try:
+        conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+        cur.execute("""
+            SELECT topic, difficulty, correct, ts
+            FROM attempts
+            WHERE student_id = ?
+            ORDER BY ts ASC
+        """, (student_id,))
+        rows = cur.fetchall()
+        conn.close()
+    except Exception:
+        logger.exception("DB fetch in /recommendation failed; using empty history.")
+        rows = []
+
+    # Policy routing (safe wrappers for model policies)
     if policy == "cf":
-        topics = recommend_cf(student_id, k)
-    elif policy in ("logreg","lr"):
-        topics = recommend_lr(student_id, k)
+        topics = safe_cf(student_id, k)
+    elif policy in ("logreg", "lr"):
+        topics = safe_lr(student_id, k)
     elif policy == "hybrid":
-        topics = recommend_hybrid(student_id, k)
+        topics = safe_hybrid(student_id, k)
     else:
+        # Baseline: weakness + staleness over the ACTIVE set
         if not rows:
-            topics = random.sample(TOPICS, k=min(k,len(TOPICS)))
+            topics = random.sample(cand, k=min(k, len(cand)))
         else:
             from collections import defaultdict
             stats = defaultdict(lambda: {"sum":0,"cnt":0,"last":None,"prev":0.5})
@@ -273,19 +384,29 @@ def get_recommendation(student_id: str, k: int = 3, policy: str = "baseline"):
                 d = stats[topic]
                 d["prev"] = d["sum"]/d["cnt"] if d["cnt"]>0 else 0.5
                 d["sum"] += int(correct); d["cnt"] += 1; d["last"] = ts
+
             now = datetime.datetime.utcnow()
             def score(t):
                 d = stats.get(t, {"prev":0.5,"last":None})
                 if d["last"]:
-                    try: last = datetime.datetime.fromisoformat(d["last"])
-                    except: last = now - datetime.timedelta(days=60)
+                    try:
+                        last = datetime.datetime.fromisoformat(d["last"])
+                    except Exception:
+                        last = now - datetime.timedelta(days=60)
                     days = (now - last).days
                 else:
                     days = 60
-                return (1.0 - d["prev"]) + 0.002*days
-            topics = sorted(TOPICS, key=lambda t: score(t), reverse=True)[:k]
+                return (1.0 - d["prev"]) + 0.002 * days
+
+            topics = sorted(cand, key=lambda t: score(t), reverse=True)[:k]
+
+    # Final sanitation: ensure exactly k topics from cand
+    topics = [t for t in topics if t in cand][:k]
+    if len(topics) < k:
+        topics = (topics + [t for t in cand if t not in topics])[:k]
 
     return RecommendationOut(policy=policy, student_id=student_id, next_topics=topics)
+
 
 @app.post("/train")
 def train_now():
