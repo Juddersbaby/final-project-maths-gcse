@@ -183,12 +183,17 @@ def post_attempt(a: AttemptIn):
 
 def load_df():
     conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("SELECT student_id, topic, difficulty, correct, ts FROM attempts ORDER BY ts ASC", conn)
+    df = pd.read_sql_query(
+        "SELECT student_id, topic, difficulty, correct, ts FROM attempts ORDER BY ts ASC",
+        conn
+    )
     conn.close()
     if df.empty:
         return df
-    df["ts"] = pd.to_datetime(df["ts"])
+    # Parse ANY incoming datetimes as UTC then drop tz to make them tz-naive
+    df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce").dt.tz_convert(None)
     return df
+
 
 def build_features(df: pd.DataFrame):
     df = df.sort_values(["student_id","ts"]).copy()
@@ -236,11 +241,13 @@ def topic_days_since(user: str):
     if dfu.empty:
         return out
     last = dfu.groupby("topic")["ts"].max().to_dict()
-    now = pd.Timestamp.utcnow()
+    # Ensure tz-naive 'now' to match df["ts"]
+    now = pd.Timestamp.utcnow().tz_localize(None)
     for t in cand:
-        if t in last:
+        if t in last and pd.notna(last[t]):
             out[t] = int((now - last[t]).days)
     return out
+
 
 
 def recommend_cf(user: str, k: int):
