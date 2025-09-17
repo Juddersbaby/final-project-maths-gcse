@@ -1,0 +1,293 @@
+﻿from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from typing import List, Optional
+import sqlite3, datetime, random
+import numpy as np
+import pandas as pd
+from sklearn.decomposition import TruncatedSVD
+from sklearn.linear_model import LogisticRegression
+
+DB_PATH = "app.db"
+TOPICS = [
+    "Number","Algebra","Ratio & Proportion","Geometry","Trigonometry","Probability",
+    "Statistics","Sequences","Graphs","Transformations","Vectors","Equations","Inequalities","Functions"
+]
+
+def recommend_ucb(user: str, k: int):
+    # per-topic Beta(1+success, 1+fail) from this student's history
+    df = load_df()
+    if df.empty: return random.sample(TOPICS, k=min(k, len(TOPICS)))
+    g = df[df["student_id"]==user].groupby("topic")["correct"].agg(["sum","count"])
+    scores = {}
+    for t in TOPICS:
+        s = g.loc[t]["sum"] if t in g.index else 0
+        c = g.loc[t]["count"] if t in g.index else 0
+        # UCB from Beta posterior mean + uncertainty bonus
+        mean = (1+s)/(2+c)
+        bonus = np.sqrt(2*np.log(1+g["count"].sum()+1) / (1+c))
+        scores[t] = mean + 0.2*bonus
+    ranked = sorted(TOPICS, key=lambda x: scores[x])
+    return ranked[:k]
+
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+    # attempts table (already in your app)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id TEXT NOT NULL,
+            topic TEXT NOT NULL,
+            difficulty INTEGER NOT NULL,
+            correct INTEGER NOT NULL,
+            ts TEXT NOT NULL
+        )
+    """)
+    # NEW: papers and questions metadata (links + page ranges only)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS papers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            board TEXT,
+            tier TEXT,
+            series TEXT,
+            paper_no INTEGER,
+            calculator INTEGER,
+            year INTEGER,
+            pdf_url TEXT NOT NULL,
+            markscheme_url TEXT,
+            UNIQUE(board,tier,series,paper_no)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            paper_id INTEGER NOT NULL,
+            qno INTEGER NOT NULL,
+            marks INTEGER,
+            page_start INTEGER NOT NULL,
+            page_end INTEGER NOT NULL,
+            topic TEXT,
+            difficulty INTEGER,
+            FOREIGN KEY(paper_id) REFERENCES papers(id),
+            UNIQUE(paper_id, qno)
+        )
+    """)
+    conn.commit(); conn.close()
+init_db()
+
+app = FastAPI(title="Adaptive Quiz API", version="0.3.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000","http://127.0.0.1:3000"],
+    allow_methods=["*"], allow_headers=["*"], allow_credentials=False
+)
+
+class AttemptIn(BaseModel):
+    student_id: str
+    topic: str
+    difficulty: int = Field(ge=1, le=3)
+    correct: int = Field(ge=0, le=1)
+    timestamp: Optional[str] = None
+
+class RecommendationOut(BaseModel):
+    policy: str
+    student_id: str
+    next_topics: List[str]
+
+@app.get("/health")
+def health():
+    return {"ok": True, "version": "0.3.0"}
+
+@app.get("/topics")
+def get_topics():
+    return [{"topic": t} for t in TOPICS]
+
+# ---------- Papers & Questions endpoints ----------
+def _get_paper_url(paper_id: int) -> str:
+    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+    cur.execute("SELECT pdf_url FROM papers WHERE id=?", (paper_id,))
+    row = cur.fetchone(); conn.close()
+    return row[0] if row else ""
+
+@app.get("/papers")
+def list_papers(board: str = "Edexcel", tier: Optional[str] = None):
+    conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row; cur = conn.cursor()
+    if tier:
+        cur.execute("SELECT * FROM papers WHERE board=? AND tier=? ORDER BY year DESC, paper_no", (board, tier))
+    else:
+        cur.execute("SELECT * FROM papers WHERE board=? ORDER BY year DESC, paper_no", (board,))
+    out = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return out
+
+@app.get("/questions")
+def list_questions(paper_id: int = Query(..., description="papers.id to fetch")):
+    conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row; cur = conn.cursor()
+    cur.execute("SELECT * FROM questions WHERE paper_id=? ORDER BY qno", (paper_id,))
+    out = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    base = _get_paper_url(paper_id)
+    for r in out:
+        r["open_url"] = f"{base}#page={r['page_start']}"
+    return out
+
+# ---------- Attempts & Recommenders (your existing logic) ----------
+@app.post("/attempt")
+def post_attempt(a: AttemptIn):
+    if a.topic not in TOPICS:
+        raise HTTPException(status_code=400, detail="Unknown topic")
+    ts = a.timestamp or datetime.datetime.utcnow().isoformat()
+    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO attempts(student_id, topic, difficulty, correct, ts)
+        VALUES (?, ?, ?, ?, ?)
+    """, (a.student_id.strip(), a.topic, int(a.difficulty), int(a.correct), ts))
+    conn.commit(); conn.close()
+    MODELS["dirty"] = True
+    return {"ok": True}
+
+def load_df():
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query("SELECT student_id, topic, difficulty, correct, ts FROM attempts ORDER BY ts ASC", conn)
+    conn.close()
+    if df.empty:
+        return df
+    df["ts"] = pd.to_datetime(df["ts"])
+    return df
+
+def build_features(df: pd.DataFrame):
+    df = df.sort_values(["student_id","ts"]).copy()
+    grp = df.groupby(["student_id","topic"])["correct"]
+    cumsum = grp.cumsum() - df["correct"]
+    cnt = grp.cumcount()
+    df["prev_mean"] = np.where(cnt>0, cumsum/ cnt, 0.5)
+    prev_time = df.groupby(["student_id","topic"])["ts"].shift(1)
+    days = (df["ts"] - prev_time).dt.days.fillna(60).clip(0, 90).astype(int)
+    df["days_since_topic"] = days
+    df["topic_id"] = df["topic"].astype("category").cat.codes
+    return df
+
+def train_models():
+    df = load_df()
+    if df.empty:
+        MODELS["cf"] = None; MODELS["lr"] = None; MODELS["dirty"] = False; MODELS["meta"] = {}
+        return
+    df = build_features(df)
+    mat = df.groupby(["student_id","topic"])["correct"].mean().unstack(fill_value=np.nan)
+    topic_means = mat.mean(axis=0).fillna(df["correct"].mean())
+    mat_filled = mat.fillna(topic_means)
+    mat_centered = mat_filled - topic_means
+    svd = TruncatedSVD(n_components=min(8, min(mat_centered.shape)-1), random_state=0)
+    U = svd.fit_transform(mat_centered); S = svd.singular_values_; Vt = svd.components_
+    recon = (U @ np.diag(S) @ Vt) + topic_means.values
+    recon_df = pd.DataFrame(recon, index=mat.index, columns=mat.columns).clip(0.05, 0.95)
+    topics_n = int(df["topic_id"].max() + 1)
+    X_num = df[["prev_mean","difficulty","days_since_topic"]].to_numpy(float)
+    topic_oh = np.zeros((len(df), topics_n)); topic_oh[np.arange(len(df)), df["topic_id"].values] = 1.0
+    X = np.hstack([X_num, topic_oh]); y = df["correct"].values
+    lr = LogisticRegression(max_iter=500, solver="lbfgs"); lr.fit(X, y)
+    MODELS["cf"] = {"recon": recon_df, "topic_means": topic_means}
+    MODELS["lr"] = {"model": lr, "topics_n": topics_n, "topic_index": dict(zip(df["topic"].astype("category").cat.categories, range(topics_n)))}
+    MODELS["dirty"] = False
+    MODELS["meta"] = {"users": mat.index.tolist(), "topics": list(mat.columns)}
+
+def topic_days_since(user: str):
+    df = load_df()
+    out = {t: 60 for t in TOPICS}
+    if df.empty: return out
+    dfu = df[df["student_id"] == user]
+    if dfu.empty: return out
+    last = dfu.groupby("topic")["ts"].max().to_dict()
+    now = pd.Timestamp.utcnow()
+    for t in TOPICS:
+        if t in last:
+            out[t] = int((now - last[t]).days)
+    return out
+
+def recommend_cf(user: str, k: int):
+    m = MODELS.get("cf")
+    if not m: return random.sample(TOPICS, k=min(k,len(TOPICS)))
+    recon_df, topic_means = m["recon"], m["topic_means"]
+    probs = recon_df.loc[user].to_dict() if (user in recon_df.index) else {t: float(topic_means.get(t, 0.6)) for t in TOPICS}
+    days = topic_days_since(user)
+    scored = sorted(TOPICS, key=lambda t: (1.0 - probs.get(t, 0.6)) + 0.002*days[t], reverse=True)
+    return scored[:k]
+
+def recommend_lr(user: str, k: int, difficulty: int = 2):
+    m = MODELS.get("lr")
+    if not m: return random.sample(TOPICS, k=min(k,len(TOPICS)))
+    lr = m["model"]; topics_n = m["topics_n"]; topic_index = m["topic_index"]
+    df = load_df()
+    prev = df[df["student_id"] == user].groupby("topic")["correct"].mean().to_dict()
+    days = topic_days_since(user)
+    rows = []
+    for t in TOPICS:
+        pm = prev.get(t, 0.5); ds = days.get(t, 60)
+        xnum = np.array([pm, float(difficulty), float(ds)], dtype=float)
+        oh = np.zeros(topics_n); idx = topic_index.get(t, None)
+        if idx is not None: oh[idx] = 1.0
+        rows.append((t, np.concatenate([xnum, oh])))
+    X = np.vstack([r[1] for r in rows])
+    probs = lr.predict_proba(X)[:,1]
+    topic_prob = {rows[i][0]: float(probs[i]) for i in range(len(rows))}
+    scored = sorted(TOPICS, key=lambda t: (1.0 - topic_prob[t]) + 0.002*days[t], reverse=True)
+    return scored[:k]
+
+def recommend_hybrid(user: str, k: int):
+    a = recommend_cf(user, len(TOPICS)); b = recommend_lr(user, len(TOPICS))
+    rank_a = {t:i for i,t in enumerate(a)}; rank_b = {t:i for i,t in enumerate(b)}
+    scored = sorted(TOPICS, key=lambda t: -(1.0/(1+rank_a.get(t,99)) + 1.0/(1+rank_b.get(t,99))))
+    return scored[:k]
+
+MODELS = {"cf": None, "lr": None, "dirty": True, "meta": {}}
+def ensure_models():
+    if MODELS.get("dirty", True) or (MODELS["cf"] is None and MODELS["lr"] is None):
+        train_models()
+
+@app.get("/recommendation", response_model=RecommendationOut)
+def get_recommendation(student_id: str, k: int = 3, policy: str = "baseline"):
+    policy = policy.lower().strip()
+    if policy in ("cf","logreg","hybrid"): ensure_models()
+    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+    cur.execute("""
+        SELECT topic, difficulty, correct, ts
+        FROM attempts
+        WHERE student_id = ?
+        ORDER BY ts ASC
+    """, (student_id,)); rows = cur.fetchall(); conn.close()
+
+    if policy == "cf":
+        topics = recommend_cf(student_id, k)
+    elif policy in ("logreg","lr"):
+        topics = recommend_lr(student_id, k)
+    elif policy == "hybrid":
+        topics = recommend_hybrid(student_id, k)
+    else:
+        if not rows:
+            topics = random.sample(TOPICS, k=min(k,len(TOPICS)))
+        else:
+            from collections import defaultdict
+            stats = defaultdict(lambda: {"sum":0,"cnt":0,"last":None,"prev":0.5})
+            for topic, difficulty, correct, ts in rows:
+                d = stats[topic]
+                d["prev"] = d["sum"]/d["cnt"] if d["cnt"]>0 else 0.5
+                d["sum"] += int(correct); d["cnt"] += 1; d["last"] = ts
+            now = datetime.datetime.utcnow()
+            def score(t):
+                d = stats.get(t, {"prev":0.5,"last":None})
+                if d["last"]:
+                    try: last = datetime.datetime.fromisoformat(d["last"])
+                    except: last = now - datetime.timedelta(days=60)
+                    days = (now - last).days
+                else:
+                    days = 60
+                return (1.0 - d["prev"]) + 0.002*days
+            topics = sorted(TOPICS, key=lambda t: score(t), reverse=True)[:k]
+
+    return RecommendationOut(policy=policy, student_id=student_id, next_topics=topics)
+
+@app.post("/train")
+def train_now():
+    train_models()
+    return {"ok": True, "meta": MODELS.get("meta", {})}
