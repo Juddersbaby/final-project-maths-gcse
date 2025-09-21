@@ -51,48 +51,7 @@ def active_topics():
     # Last resort: full constant
     return TOPICS
 
-# --- helper to fetch all questions ---
-def get_questions_df():
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("""
-        SELECT id, paper_id, qno, topic, marks, difficulty, page_start, page_end, open_url, text_snippet
-        FROM questions
-    """, conn)
-    conn.close()
-    df["text"] = df["text_snippet"].fillna("").astype(str).str.replace(r"\s+"," ", regex=True).str.strip()
-    return df
 
-# --- build TF-IDF index for questions; store in MODELS['tfidf'] ---
-def build_tfidf_questions():
-    df = get_questions_df()
-    # Require at least 2 non-empty docs
-    docs = [t for t in df["text"].tolist() if t]
-    if len(docs) < 2:
-        MODELS["tfidf"] = None
-        return
-    vec = TfidfVectorizer(min_df=1, max_df=0.9, ngram_range=(1,2))
-    X = vec.fit_transform(df["text"].tolist())
-    MODELS["tfidf"] = {"vectorizer": vec, "X": X, "qdf": df}
-
-def ensure_tfidf():
-    if MODELS.get("tfidf", "MISSING") == "MISSING":
-        # First call builds; later we rebuild on demand if questions changed
-        build_tfidf_questions()
-    return MODELS.get("tfidf", None)
-
-# Optional: topic TF-IDF centroids for fallback “student profile”
-def topic_tfidf_centroids():
-    m = MODELS.get("tfidf")
-    if not m:
-        return {}
-    df = m["qdf"]; X = m["X"]
-    centroids = {}
-    # Build sparse centroids
-    for t in df["topic"].dropna().unique():
-        idx = np.where(df["topic"].values == t)[0]
-        if len(idx) > 0:
-            centroids[t] = X[idx].mean(axis=0)  # returns 1 x n sparse row
-    return centroids
 
 def recommend_ucb(user: str, k: int):
     # per-topic Beta(1+success, 1+fail) from this student's history
@@ -180,7 +139,7 @@ def migrate_schema():
     try:
         cur.execute("""
             UPDATE questions
-            SET open_url = (SELECT url FROM papers WHERE papers.id = questions.paper_id)
+            SET open_url = (SELECT pdf_url FROM papers WHERE papers.id = questions.paper_id)
                            || '#page=' || COALESCE(page_start,1)
             WHERE (open_url IS NULL OR open_url = '')
         """)
@@ -537,6 +496,16 @@ def recommend_questions(student_id: str = Query(...), k: int = Query(5, ge=1, le
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get topics: {e}")
 
+    # load question table as DataFrame
+    def get_questions_df():
+        conn = sqlite3.connect(DB_PATH)
+        df = pd.read_sql_query("SELECT id, paper_id, qno, topic, marks, difficulty, page_start, page_end, open_url, text_snippet FROM questions", conn)
+        conn.close()
+        if df.empty:
+            return df
+        df["text"] = df["text_snippet"].fillna("").astype(str).str.replace(r"\s+"," ", regex=True).str.strip()
+        return df
+
     qdf = get_questions_df()
     if qdf.empty:
         raise HTTPException(status_code=404, detail="No questions in database. Ingest a paper first.")
@@ -582,10 +551,21 @@ def recommend_questions(student_id: str = Query(...), k: int = Query(5, ge=1, le
     seen, out_rows = set(), []
 
     def push_rows(frame):
+        # get papers url map once
+        conn = sqlite3.connect(DB_PATH)
+        paper_url = pd.read_sql_query("SELECT id, pdf_url FROM papers", conn).set_index("id")["pdf_url"].to_dict()
+        conn.close()
         for _, r in frame.iterrows():
             rid = int(r["id"])
-            if rid in seen: 
+            if rid in seen:
                 continue
+            # compute open_url if missing
+            ou = r.get("open_url")
+            if not ou:
+                base = paper_url.get(int(r["paper_id"])) if pd.notna(r["paper_id"]) else None
+                if base:
+                    ou = f"{base}#page={int(r['page_start']) if pd.notna(r['page_start']) else 1}"
+
             out_rows.append({
                 "id": rid,
                 "paper_id": int(r["paper_id"]) if pd.notna(r["paper_id"]) else None,
@@ -595,11 +575,12 @@ def recommend_questions(student_id: str = Query(...), k: int = Query(5, ge=1, le
                 "difficulty": int(r["difficulty"]) if pd.notna(r["difficulty"]) else None,
                 "page_start": int(r["page_start"]) if pd.notna(r["page_start"]) else None,
                 "page_end": int(r["page_end"]) if pd.notna(r["page_end"]) else None,
-                "open_url": r["open_url"],
+                "open_url": ou,
             })
             seen.add(rid)
             if len(out_rows) >= k:
                 break
+
 
     # 3a) use TF-IDF ordering if we have it
     if ranked_ids:
