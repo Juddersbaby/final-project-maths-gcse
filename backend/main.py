@@ -9,6 +9,7 @@ from sklearn.decomposition import TruncatedSVD
 from sklearn.linear_model import LogisticRegression
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from fastapi import Query
 import json
 import logging, traceback
 logger = logging.getLogger("uvicorn.error")
@@ -49,6 +50,7 @@ def active_topics():
 
     # Last resort: full constant
     return TOPICS
+
 
 
 def recommend_ucb(user: str, k: int):
@@ -125,6 +127,28 @@ def init_db():
     conn.commit(); conn.close()
 init_db()
 
+def migrate_schema():
+    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+    # Ensure questions has open_url and text_snippet
+    cols = [r[1] for r in cur.execute("PRAGMA table_info(questions)").fetchall()]
+    if "open_url" not in cols:
+        cur.execute("ALTER TABLE questions ADD COLUMN open_url TEXT")
+    if "text_snippet" not in cols:
+        cur.execute("ALTER TABLE questions ADD COLUMN text_snippet TEXT")
+    # Best-effort backfill open_url
+    try:
+        cur.execute("""
+            UPDATE questions
+            SET open_url = (SELECT pdf_url FROM papers WHERE papers.id = questions.paper_id)
+                           || '#page=' || COALESCE(page_start,1)
+            WHERE (open_url IS NULL OR open_url = '')
+        """)
+    except Exception:
+        pass
+    conn.commit(); conn.close()
+
+init_db()
+migrate_schema()
 
 def build_tfidf_questions():
     """Build and cache TF-IDF matrix for all questions (text_snippet).
@@ -384,6 +408,12 @@ def ensure_models():
     if MODELS.get("dirty", True) or (MODELS["cf"] is None and MODELS["lr"] is None):
         train_models()
 
+# Pre-build TF-IDF question index at startup so recommend_questions can respond fast
+try:
+    ensure_tfidf()
+except Exception:
+    MODELS['tfidf'] = None
+
 @app.get("/recommendation", response_model=RecommendationOut)
 def get_recommendation(student_id: str, k: int = 3, policy: str = "baseline"):
     policy = policy.lower().strip()
@@ -459,109 +489,135 @@ def get_recommendation(student_id: str, k: int = 3, policy: str = "baseline"):
 
 
 @app.get("/recommend_questions")
-def get_recommend_questions(student_id: str, k: int = 5, policy: str = "baseline"):
-    """Return up to k question rows mapped from topic recommendations.
-    Strategy: get topic ranking from chosen policy, then for each topic
-    fetch candidate questions ordered by most recent insertion (q.id desc) and
-    fill until k results. Falls back to random questions if DB is empty.
-    """
-    # Reuse the existing recommendation logic to get topic ranking
-    rec = get_recommendation(student_id=student_id, k=len(TOPICS), policy=policy)
-    topics = rec.next_topics
-
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-
-    ensure_tfidf()
-    tf = MODELS.get('tfidf')
-
-    out = []
-    # If TF-IDF is available and student has history snippets, build a profile
-    student_profile_vec = None
+def recommend_questions(student_id: str = Query(...), k: int = Query(5, ge=1, le=20), policy: str = "logreg"):
+    # 1) get topic recs (always works because it’s the same logic as /recommendation)
     try:
-        if tf is not None:
-            # collect student's attempted question snippets (if any)
-            cur.execute("SELECT q.text_snippet FROM attempts a JOIN questions q ON a.topic = q.topic WHERE a.student_id = ?", (student_id,))
-            hist_texts = [r[0] for r in cur.fetchall() if r[0]]
-            if hist_texts:
-                vec = tf['vectorizer']
-                T = vec.transform(hist_texts)
-                student_profile_vec = T.mean(axis=0)
+        topics = get_recommendation(student_id=student_id, k=min(max(k,3), len(TOPICS)), policy=policy).next_topics
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get topics: {e}")
+
+    # load question table as DataFrame
+    def get_questions_df():
+        conn = sqlite3.connect(DB_PATH)
+        df = pd.read_sql_query("SELECT id, paper_id, qno, topic, marks, difficulty, page_start, page_end, open_url, text_snippet FROM questions", conn)
+        conn.close()
+        if df.empty:
+            return df
+        df["text"] = df["text_snippet"].fillna("").astype(str).str.replace(r"\s+"," ", regex=True).str.strip()
+        return df
+
+    qdf = get_questions_df()
+    if qdf.empty:
+        raise HTTPException(status_code=404, detail="No questions in database. Ingest a paper first.")
+
+    cand_df = qdf[qdf["topic"].isin(topics)].copy()
+    if cand_df.empty:
+        cand_df = qdf.copy()
+
+    # 2) try TF-IDF ranking if available, else ignore any TF-IDF errors and fall back
+    ranked_ids = []
+    try:
+        tf = ensure_tfidf()  # may not exist or may be None
+        if tf:
+            from sklearn.metrics.pairwise import cosine_similarity
+            # build very simple user vector = sum of topic centroids we have
+            def topic_tfidf_centroids():
+                X = tf["X"]; df_all = tf["qdf"]
+                cents = {}
+                for t in df_all["topic"].dropna().unique():
+                    idx = np.where(df_all["topic"].values == t)[0]
+                    if len(idx) > 0:
+                        cents[t] = X[idx].mean(axis=0)
+                return cents
+
+            cents = topic_tfidf_centroids()
+            user_vec = None; cnt = 0
+            for t in topics:
+                c = cents.get(t)
+                if c is not None:
+                    user_vec = c if user_vec is None else (user_vec + c)
+                    cnt += 1
+            if user_vec is not None and cnt > 0:
+                sims = cosine_similarity(user_vec, tf["X"]).ravel()
+                # restrict to candidate topic questions
+                mask = np.zeros(len(tf["qdf"]), dtype=bool)
+                mask[cand_df.index.values] = True
+                rank_all = np.argsort(sims)[::-1]
+                ranked_ids = tf["qdf"].iloc[rank_all][mask[rank_all]]["id"].tolist()
     except Exception:
-        student_profile_vec = None
+        ranked_ids = []  # ignore TF-IDF issues and fall back
 
-    if student_profile_vec is not None:
-        # Rank all questions by cosine similarity to student profile
-        X = MODELS['tfidf']['X']
-        sims = cosine_similarity(student_profile_vec, X).flatten()
-        idxs = sims.argsort()[::-1]
-        for idx in idxs:
-            if len(out) >= k:
-                break
-            qid = MODELS['tfidf']['ids'][idx]
-            cur.execute("SELECT q.*, p.pdf_url FROM questions q JOIN papers p ON q.paper_id = p.id WHERE q.id = ?", (qid,))
-            r = cur.fetchone()
-            if not r: continue
-            out.append({
-                "question_id": r["id"],
-                "paper_id": r["paper_id"],
-                "qno": r["qno"],
+    # 3) assemble output without duplicates
+    seen, out_rows = set(), []
+
+    def push_rows(frame):
+        # get papers url map once
+        conn = sqlite3.connect(DB_PATH)
+        paper_url = pd.read_sql_query("SELECT id, pdf_url FROM papers", conn).set_index("id")["pdf_url"].to_dict()
+        conn.close()
+        for _, r in frame.iterrows():
+            rid = int(r["id"])
+            if rid in seen:
+                continue
+            # compute open_url if missing
+            ou = r.get("open_url")
+            if not ou:
+                base = paper_url.get(int(r["paper_id"])) if pd.notna(r["paper_id"]) else None
+                if base:
+                    ou = f"{base}#page={int(r['page_start']) if pd.notna(r['page_start']) else 1}"
+
+            out_rows.append({
+                "id": rid,
+                "paper_id": int(r["paper_id"]) if pd.notna(r["paper_id"]) else None,
+                "qno": int(r["qno"]) if pd.notna(r["qno"]) else None,
                 "topic": r["topic"],
-                "difficulty": r["difficulty"],
-                "page_start": r["page_start"],
-                "page_end": r["page_end"],
-                "open_url": f"{r['pdf_url']}#page={r['page_start']}",
-                "text_snippet": r.get("text_snippet") if "text_snippet" in r.keys() else None,
+                "marks": int(r["marks"]) if pd.notna(r["marks"]) else None,
+                "difficulty": int(r["difficulty"]) if pd.notna(r["difficulty"]) else None,
+                "page_start": int(r["page_start"]) if pd.notna(r["page_start"]) else None,
+                "page_end": int(r["page_end"]) if pd.notna(r["page_end"]) else None,
+                "open_url": ou,
             })
-    else:
-        # Fallback: topic mapping (as before)
-        for t in topics:
-            if len(out) >= k:
+            seen.add(rid)
+            if len(out_rows) >= k:
                 break
-            # Prefer questions with the topic, newest first
-            cur.execute("SELECT q.*, p.pdf_url FROM questions q JOIN papers p ON q.paper_id = p.id WHERE q.topic = ? ORDER BY q.id DESC", (t,))
-            rows = cur.fetchall()
-            for r in rows:
-                if len(out) >= k:
-                    break
-                rec_item = {
-                    "question_id": r["id"],
-                    "paper_id": r["paper_id"],
-                    "qno": r["qno"],
-                    "topic": r["topic"],
-                    "difficulty": r["difficulty"],
-                    "page_start": r["page_start"],
-                    "page_end": r["page_end"],
-                    "open_url": f"{r['pdf_url']}#page={r['page_start']}",
-                    "text_snippet": r.get("text_snippet") if "text_snippet" in r.keys() else None,
-                }
-                out.append(rec_item)
-    # If still short, pad with random questions
-    if len(out) < k:
-        cur.execute("SELECT q.*, p.pdf_url FROM questions q JOIN papers p ON q.paper_id = p.id ORDER BY RANDOM() LIMIT ?", (k - len(out),))
-        for r in cur.fetchall():
-            out.append({
-                "question_id": r["id"],
-                "paper_id": r["paper_id"],
-                "qno": r["qno"],
-                "topic": r["topic"],
-                "difficulty": r["difficulty"],
-                "page_start": r["page_start"],
-                "page_end": r["page_end"],
-                "open_url": f"{r['pdf_url']}#page={r['page_start']}",
-                "text_snippet": r.get("text_snippet") if "text_snippet" in r.keys() else None,
-            })
-    # Log A/B entry
+
+
+    # 3a) use TF-IDF ordering if we have it
+    if ranked_ids:
+        ordered = cand_df.set_index("id").loc[[i for i in ranked_ids if i in cand_df["id"].values]].reset_index()
+        push_rows(ordered)
+
+    # 3b) fill from candidate topics randomly (consistent seed for reproducibility)
+    if len(out_rows) < k:
+        push_rows(cand_df.sample(frac=1.0, random_state=0))
+
+    # 3c) pad from any topic if still short
+    if len(out_rows) < k:
+        rest = qdf[~qdf["id"].isin(seen)].sample(frac=1.0, random_state=1)
+        push_rows(rest)
+
+    # 4) best-effort A/B log (won’t crash on errors)
     try:
-        payload = json.dumps({"k": k, "policy": policy, "topic_order": topics[:10]})
-        cur.execute("INSERT INTO ab_log(student_id, policy, k, payload, ts) VALUES (?,?,?,?,?)",
-                    (student_id, policy, int(k), payload, datetime.datetime.utcnow().isoformat()))
-        conn.commit()
+        conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+        cur.execute("""
+          CREATE TABLE IF NOT EXISTS ab_log(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            student_id TEXT NOT NULL,
+            policy TEXT NOT NULL,
+            item_type TEXT NOT NULL,
+            item_ids TEXT NOT NULL
+          )
+        """)
+        now = datetime.datetime.utcnow().isoformat()
+        ids_str = ",".join(str(r["id"]) for r in out_rows)
+        cur.execute("INSERT INTO ab_log(ts, student_id, policy, item_type, item_ids) VALUES (?, ?, ?, ?, ?)",
+                    (now, student_id, policy, "question", ids_str))
+        conn.commit(); conn.close()
     except Exception:
         pass
-    conn.close()
-    return {"student_id": student_id, "policy": policy, "questions": out[:k]}
+
+    return {"policy": policy, "student_id": student_id, "k": k, "topics_used": topics, "items": out_rows}
 
 
 @app.post("/train")
