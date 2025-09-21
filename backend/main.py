@@ -1,4 +1,5 @@
 ﻿from fastapi import FastAPI, HTTPException, Query
+from fastapi import UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional
@@ -129,6 +130,29 @@ init_db()
 
 def migrate_schema():
     conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+    # Ensure classes and students tables exist
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS classes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            created_at TEXT
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS students (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id TEXT NOT NULL UNIQUE,
+            name TEXT,
+            class_id INTEGER,
+            created_at TEXT,
+            FOREIGN KEY(class_id) REFERENCES classes(id)
+        )
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_students_class_id ON students(class_id)")
     # Ensure questions has open_url and text_snippet
     cols = [r[1] for r in cur.execute("PRAGMA table_info(questions)").fetchall()]
     if "open_url" not in cols:
@@ -196,6 +220,13 @@ class RecommendationOut(BaseModel):
     student_id: str
     next_topics: List[str]
 
+class ClassIn(BaseModel):
+    name: str = Field(min_length=1)
+
+class StudentIn(BaseModel):
+    student_id: str = Field(min_length=1)
+    name: Optional[str] = None
+
 @app.get("/health")
 def health():
     return {"ok": True, "version": "0.3.0"}
@@ -247,6 +278,111 @@ def post_attempt(a: AttemptIn):
     conn.commit(); conn.close()
     MODELS["dirty"] = True
     return {"ok": True}
+
+# ---------- Classes & Students (lightweight CRUD) ----------
+@app.get("/classes")
+def list_classes():
+    conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row; cur = conn.cursor()
+    cur.execute("SELECT c.id, c.name, COALESCE(cnt.cnt,0) AS student_count FROM classes c LEFT JOIN (SELECT class_id, COUNT(1) AS cnt FROM students GROUP BY class_id) cnt ON c.id = cnt.class_id ORDER BY c.name")
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+@app.post("/classes")
+def create_class(payload: ClassIn):
+    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+    try:
+        ts = datetime.datetime.utcnow().isoformat()
+        cur.execute("INSERT INTO classes(name, created_at) VALUES(?, ?)", (payload.name.strip(), ts))
+        cid = cur.lastrowid
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        raise HTTPException(status_code=409, detail="Class already exists")
+    conn.close()
+    return {"id": cid, "name": payload.name}
+
+@app.delete("/classes/{class_id}")
+def delete_class(class_id: int):
+    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+    # Detach students first (keep their identity and attempts)
+    cur.execute("UPDATE students SET class_id = NULL WHERE class_id = ?", (class_id,))
+    cur.execute("DELETE FROM classes WHERE id = ?", (class_id,))
+    conn.commit(); conn.close()
+    return {"ok": True}
+
+@app.get("/classes/{class_id}/students")
+def list_class_students(class_id: int):
+    conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row; cur = conn.cursor()
+    cur.execute("SELECT id, student_id, name, class_id, created_at FROM students WHERE class_id = ? ORDER BY student_id", (class_id,))
+    out = [dict(r) for r in cur.fetchall()]
+    conn.close(); return out
+
+@app.post("/classes/{class_id}/students")
+def add_student_to_class(class_id: int, payload: StudentIn):
+    sid = payload.student_id.strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="student_id required")
+    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+    ts = datetime.datetime.utcnow().isoformat()
+    # Upsert-like: try insert; if exists, update class_id and name
+    try:
+        cur.execute("INSERT INTO students(student_id, name, class_id, created_at) VALUES(?, ?, ?, ?)", (sid, payload.name, class_id, ts))
+    except sqlite3.IntegrityError:
+        cur.execute("UPDATE students SET class_id = ?, name = COALESCE(?, name) WHERE student_id = ?", (class_id, payload.name, sid))
+    conn.commit(); conn.close()
+    return {"ok": True, "student_id": sid, "class_id": class_id}
+
+@app.delete("/classes/{class_id}/students/{student_id}")
+def remove_student_from_class(class_id: int, student_id: str):
+    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+    cur.execute("UPDATE students SET class_id = NULL WHERE class_id = ? AND student_id = ?", (class_id, student_id))
+    conn.commit(); conn.close()
+    return {"ok": True}
+
+@app.post("/students/{student_id}/upload_csv")
+async def upload_student_csv(student_id: str, file: UploadFile = File(...)):
+    # Expect CSV with columns: topic, difficulty, correct, ts(optional)
+    content = await file.read()
+    try:
+        from io import StringIO
+        buf = StringIO(content.decode('utf-8', errors='ignore'))
+        df = pd.read_csv(buf)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid CSV: {e}")
+
+    required = {"topic", "difficulty", "correct"}
+    if not required.issubset(set(map(str.lower, df.columns))):
+        # try case-insensitive mapping
+        cols_map = {c.lower(): c for c in df.columns}
+        if not required.issubset(cols_map.keys()):
+            raise HTTPException(status_code=400, detail="CSV must have columns: topic, difficulty, correct, [ts]")
+        df = df.rename(columns={cols_map.get("topic"): "topic", cols_map.get("difficulty"): "difficulty", cols_map.get("correct"): "correct", cols_map.get("ts"): "ts" if cols_map.get("ts") else None})
+
+    # Normalize and validate
+    df["topic"] = df["topic"].astype(str)
+    df["difficulty"] = pd.to_numeric(df["difficulty"], errors="coerce").fillna(2).clip(1,3).astype(int)
+    df["correct"] = pd.to_numeric(df["correct"], errors="coerce").fillna(0).clip(0,1).astype(int)
+    if "ts" in df.columns:
+        df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+    else:
+        df["ts"] = pd.NaT
+
+    # Filter to known topics and cap rows
+    df = df[df["topic"].isin(TOPICS)].head(5000)
+    if df.empty:
+        return {"ok": True, "inserted": 0}
+
+    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+    now_iso = datetime.datetime.utcnow().isoformat()
+    rows = []
+    for _, r in df.iterrows():
+        ts = r["ts"].isoformat() if pd.notna(r["ts"]) else now_iso
+        rows.append((student_id.strip(), r["topic"], int(r["difficulty"]), int(r["correct"]), ts))
+    cur.executemany("INSERT INTO attempts(student_id, topic, difficulty, correct, ts) VALUES (?, ?, ?, ?, ?)", rows)
+    conn.commit(); conn.close()
+    MODELS["dirty"] = True
+    return {"ok": True, "inserted": len(rows)}
 
 def load_df():
     conn = sqlite3.connect(DB_PATH)

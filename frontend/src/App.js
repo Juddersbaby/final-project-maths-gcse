@@ -1,5 +1,7 @@
 import React, { useEffect, useState } from 'react';
-import { getHealth, getTopics, postAttempt, getRecommendation } from './api';
+import { getHealth, getTopics, postAttempt, getRecommendation, listClasses, createClass, deleteClass, listClassStudents, addStudentToClass, removeStudentFromClass, uploadStudentCSV } from './api';
+import ClassView from './components/ClassView';
+import StudentView from './components/StudentView';
 
 export default function App() {
   const [status, setStatus] = useState(null);
@@ -12,11 +14,58 @@ export default function App() {
   const [policy, setPolicy] = useState('baseline');
   const [loading, setLoading] = useState(false);
   const [msg, setMsg] = useState('');
+  const [view, setView] = useState('class');
+  const [classes, setClasses] = useState([]);
+  const [newClassName, setNewClassName] = useState('');
+  const [activeClass, setActiveClass] = useState(null);
+  const [students, setStudents] = useState([]);
+  const [newStudentId, setNewStudentId] = useState('');
+  const [newStudentName, setNewStudentName] = useState('');
+  const [csvUploading, setCsvUploading] = useState(false);
 
   useEffect(() => {
     getHealth().then(setStatus).catch(() => setStatus({ ok: false }));
     getTopics().then((t) => { setTopics(t); if (t?.length) setSelTopic(t[0].topic); });
+    // Load classes
+    listClasses().then(setClasses).catch(()=>{});
   }, []);
+
+  const openClass = async (c) => {
+    setActiveClass(c);
+    setView('students');
+    try { setStudents(await listClassStudents(c.id)); } catch {}
+  };
+
+  const handleCreateClass = async () => {
+    if (!newClassName.trim()) return;
+    try {
+      const c = await createClass(newClassName.trim());
+      setClasses([...(classes||[]), { id: c.id, name: c.name, student_count: 0 }]);
+      setNewClassName('');
+    } catch (e) { alert('Failed to create class'); }
+  };
+
+  const handleDeleteClass = async (cls) => {
+    if (!window.confirm(`Delete class "${cls.name}"?`)) return;
+    try { await deleteClass(cls.id); setClasses((classes||[]).filter(x => x.id !== cls.id)); if (activeClass?.id===cls.id) { setActiveClass(null); setStudents([]); setView('class'); } } catch {}
+  };
+
+  const handleAddStudent = async () => {
+    if (!activeClass) return; if (!newStudentId.trim()) return;
+    try { await addStudentToClass(activeClass.id, newStudentId.trim(), newStudentName.trim()||undefined); setStudents([...(students||[]), { id: Date.now(), student_id: newStudentId.trim(), name: newStudentName.trim(), class_id: activeClass.id }]); setNewStudentId(''); setNewStudentName(''); } catch { alert('Failed to add student'); }
+  };
+
+  const handleRemoveStudent = async (s) => {
+    if (!activeClass) return;
+    try { await removeStudentFromClass(activeClass.id, s.student_id); setStudents((students||[]).filter(x => x.student_id !== s.student_id)); } catch {}
+  };
+
+  const handleUploadCSV = async (s, file) => {
+    if (!file) return; setCsvUploading(true);
+    try { const res = await uploadStudentCSV(s.student_id, file); alert(`Uploaded ${res.inserted} rows`); }
+    catch { alert('Upload failed'); }
+    finally { setCsvUploading(false); }
+  };
 
   const submitAttempt = async () => {
     setMsg('');
@@ -46,54 +95,131 @@ export default function App() {
   };
 
   return (
-    <div className="max-w-3xl mx-auto p-6 space-y-6">
-      <header className="flex items-center justify-between">
+    <div className="max-w-6xl mx-auto p-6 space-y-6">
+      <div className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Adaptive Quiz Teacher</h1>
-        <span className={"text-sm " + (status?.ok ? "text-green-600" : "text-red-600")}>
-          API {status?.ok ? "connected" : "offline"}
-        </span>
-      </header>
+        <nav className="space-x-2">
+          <button onClick={() => setView('class')} className={`px-3 py-1 rounded ${view==='class'?'bg-blue-600 text-white':'border'}`}>Class View</button>
+          <button onClick={() => setView('students')} className={`px-3 py-1 rounded ${view==='students'?'bg-blue-600 text-white':'border'}`}>Student View</button>
+        </nav>
+      </div>
 
-      <section className="bg-white rounded-2xl shadow p-5 space-y-4">
-        <h2 className="text-lg font-medium">Log an attempt</h2>
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          <input className="border rounded px-3 py-2" value={studentId} onChange={e => setStudentId(e.target.value)} placeholder="Student ID" />
-          <select className="border rounded px-3 py-2" value={selTopic} onChange={e => setSelTopic(e.target.value)}>
-            {topics.map(t => <option key={t.topic} value={t.topic}>{t.topic}</option>)}
-          </select>
-          <select className="border rounded px-3 py-2" value={difficulty} onChange={e => setDifficulty(Number(e.target.value))}>
-            <option value={1}>Difficulty 1</option>
-            <option value={2}>Difficulty 2</option>
-            <option value={3}>Difficulty 3</option>
-          </select>
-          <select className="border rounded px-3 py-2" value={correct} onChange={e => setCorrect(Number(e.target.value))}>
-            <option value={1}>Correct</option>
-            <option value={0}>Incorrect</option>
-          </select>
-        </div>
-        <button onClick={submitAttempt} className="px-4 py-2 rounded bg-blue-600 text-white">Save attempt</button>
-        {msg && <div className="text-sm text-gray-700">{msg}</div>}
-      </section>
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+        <main className="col-span-2 space-y-6">
+          {view === 'class' && (
+            <div className="bg-white rounded-2xl shadow p-6 space-y-4">
+              <h3 className="text-xl font-semibold">Your Classes</h3>
+              <div className="flex gap-2">
+                <input className="border rounded px-3 py-2 flex-1" placeholder="New class name" value={newClassName} onChange={e=>setNewClassName(e.target.value)} />
+                <button className="px-3 py-2 rounded bg-blue-600 text-white" onClick={handleCreateClass}>Add</button>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {(classes||[]).map(c => (
+                  <div key={c.id} className="border rounded p-4 bg-gray-50 flex items-center justify-between">
+                    <div>
+                      <div className="font-medium">{c.name}</div>
+                      <div className="text-xs text-gray-500">{c.student_count || 0} students</div>
+                    </div>
+                    <div className="space-x-2">
+                      <button className="px-3 py-1 bg-blue-600 text-white rounded" onClick={() => openClass(c)}>View</button>
+                      <button className="px-3 py-1 border rounded" onClick={() => handleDeleteClass(c)}>Delete</button>
+                    </div>
+                  </div>
+                ))}
+                {(!classes || classes.length===0) && <div className="text-sm text-gray-600">No classes yet.</div>}
+              </div>
+            </div>
+          )}
 
-      <section className="bg-white rounded-2xl shadow p-5 space-y-4">
-        <h2 className="text-lg font-medium">Get recommendation</h2>
-        <div className="flex items-center gap-3">
-          <select className="border rounded px-3 py-2" value={policy} onChange={e => setPolicy(e.target.value)}>
-            <option value="baseline">Baseline</option>
-          </select>
-          <button onClick={fetchRecs} disabled={loading} className="px-4 py-2 rounded bg-emerald-600 text-white">
-            {loading ? "Thinking..." : "Get next topics"}
-          </button>
-        </div>
-        {recs.length > 0 && (
-          <div>
-            <h3 className="font-medium mb-2">Recommended next topics</h3>
-            <ul className="list-disc pl-6">
-              {recs.map((r, i) => <li key={i}>{r}</li>)}
-            </ul>
+          {view === 'students' && (
+            <div className="bg-white rounded-2xl shadow p-6 space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="text-xl font-semibold">{activeClass?.name || 'Class'}</h3>
+                  <div className="text-sm text-gray-600">Manage students and upload results CSV per student.</div>
+                </div>
+                <div className="space-x-2">
+                  <button onClick={()=>setView('class')} className="px-3 py-1 rounded border">Back</button>
+                </div>
+              </div>
+
+              <div className="flex gap-2">
+                <input className="border rounded px-3 py-2" placeholder="Student ID" value={newStudentId} onChange={e=>setNewStudentId(e.target.value)} />
+                <input className="border rounded px-3 py-2 flex-1" placeholder="Name (optional)" value={newStudentName} onChange={e=>setNewStudentName(e.target.value)} />
+                <button onClick={handleAddStudent} className="px-3 py-2 rounded bg-blue-600 text-white">Add Student</button>
+              </div>
+
+              <div className="space-y-2">
+                {(students||[]).map(s => (
+                  <div key={s.student_id} className="flex items-center justify-between border rounded p-3 bg-white">
+                    <div>
+                      <div className="font-medium">{s.student_id}{s.name ? ` - ${s.name}` : ''}</div>
+                      <div className="text-xs text-gray-500">Class: {activeClass?.name}</div>
+                    </div>
+                    <div className="space-x-2">
+                      <label className="px-3 py-1 border rounded cursor-pointer">
+                        <input type="file" accept=".csv" className="hidden" onChange={e => handleUploadCSV(s, e.target.files[0])} />
+                        {csvUploading ? 'Uploading...' : 'Upload CSV'}
+                      </label>
+                      <button className="px-3 py-1 border rounded" onClick={()=>handleRemoveStudent(s)}>Remove</button>
+                    </div>
+                  </div>
+                ))}
+                {(!students || students.length===0) && <div className="text-sm text-gray-600">No students yet.</div>}
+              </div>
+            </div>
+          )}
+        </main>
+
+        <aside className="col-span-1">
+          <div className="bg-white rounded-2xl shadow p-5 space-y-4">
+            <header className="flex items-center justify-between">
+              <h2 className="text-lg font-medium">Control Panel</h2>
+              <span className={"text-sm " + (status?.ok ? "text-green-600" : "text-red-600")}>
+                API {status?.ok ? "connected" : "offline"}
+              </span>
+            </header>
+            <h4 className="text-sm font-medium">Log an attempt</h4>
+            <div className="grid grid-cols-1 gap-2">
+              <input className="border rounded px-3 py-2" value={studentId} onChange={e => setStudentId(e.target.value)} placeholder="Student ID" />
+              <select className="border rounded px-3 py-2" value={selTopic} onChange={e => setSelTopic(e.target.value)}>
+                {topics.map(t => <option key={t.topic} value={t.topic}>{t.topic}</option>)}
+              </select>
+              <div className="flex gap-2">
+                <select className="border rounded px-3 py-2 flex-1" value={difficulty} onChange={e => setDifficulty(Number(e.target.value))}>
+                  <option value={1}>Difficulty 1</option>
+                  <option value={2}>Difficulty 2</option>
+                  <option value={3}>Difficulty 3</option>
+                </select>
+                <select className="border rounded px-3 py-2" value={correct} onChange={e => setCorrect(Number(e.target.value))}>
+                  <option value={1}>Correct</option>
+                  <option value={0}>Incorrect</option>
+                </select>
+              </div>
+              <button onClick={submitAttempt} className="px-4 py-2 rounded bg-blue-600 text-white">Save</button>
+              {msg && <div className="text-xs text-gray-600">{msg}</div>}
+            </div>
+
+            <hr />
+
+            <h4 className="text-sm font-medium">Recommendations</h4>
+            <div className="flex gap-2">
+              <select className="border rounded px-3 py-2 flex-1" value={policy} onChange={e => setPolicy(e.target.value)}>
+                <option value="baseline">Baseline</option>
+                <option value="logreg">LogReg</option>
+                <option value="cf">CF</option>
+                <option value="hybrid">Hybrid</option>
+              </select>
+              <button onClick={fetchRecs} disabled={loading} className="px-3 py-2 rounded bg-emerald-600 text-white">{loading ? '...' : 'Get'}</button>
+            </div>
+            {recs.length > 0 && (
+              <ul className="mt-2 list-disc pl-5 text-sm">
+                {recs.map((r,i) => <li key={i}>{r}</li>)}
+              </ul>
+            )}
           </div>
-        )}
-      </section>
+        </aside>
+      </div>
     </div>
   );
 }
