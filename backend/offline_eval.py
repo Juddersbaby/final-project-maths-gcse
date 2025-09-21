@@ -12,9 +12,9 @@ try:
 except Exception:
     plt = None
 
-# Import your backend
+# Import backend
 sys.path.append(os.path.dirname(__file__))
-import main as backend  # uses your train_models, recommend_* and active_topics
+import main as backend  # uses train_models, recommend_* and active_topics
 
 # ---------- helpers ----------
 def temporal_split(df, test_frac=0.2):
@@ -74,6 +74,18 @@ def build_lr_features_for_row(lr_meta, train_hist_by_st_topic, row):
     else:
         prev_mean = 0.5
         days_since = 60
+
+    # ---- Optional ablations via environment variables ----
+    # NO_RECENCY=1  -> zero out recency feature
+    # NO_PREVMEAN=1 -> remove prior-correctness signal
+    import os as _os
+    if _os.getenv("NO_RECENCY") == "1":
+        days_since = 0
+    if _os.getenv("NO_PREVMEAN") == "1":
+        prev_mean = 0.5
+    # ------------------------------------------------------
+
+
     xnum = np.array([prev_mean, diff, float(np.clip(days_since,0,90))], dtype=float)
     topics_n = lr_meta["topics_n"]; topic_index = lr_meta["topic_index"]
     oh = np.zeros(topics_n, dtype=float)
@@ -81,6 +93,7 @@ def build_lr_features_for_row(lr_meta, train_hist_by_st_topic, row):
     if idx is not None:
         oh[idx] = 1.0
     return np.concatenate([xnum, oh])
+
 
 def prepare_train_db(df_train, db="app.db"):
     conn = sqlite3.connect(db); cur = conn.cursor()
@@ -177,7 +190,7 @@ if __name__ == "__main__":
 
     out = evaluate(db=args.db, k=args.k, test_frac=args.test_frac, n_boot=args.n_boot)
 
-    # ---- Plots (optional) ----
+    # ---- Plots  ----
     if plt is not None:
         ci_df = out["ci_df"]
         # keep a consistent order for bars
