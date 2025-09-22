@@ -136,7 +136,8 @@ def migrate_schema():
         CREATE TABLE IF NOT EXISTS classes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE,
-            created_at TEXT
+            created_at TEXT,
+            curriculum TEXT
         )
         """
     )
@@ -153,6 +154,13 @@ def migrate_schema():
         """
     )
     cur.execute("CREATE INDEX IF NOT EXISTS idx_students_class_id ON students(class_id)")
+    # Ensure curriculum column exists on existing DBs
+    try:
+        _c_cols = [r[1] for r in cur.execute("PRAGMA table_info(classes)").fetchall()]
+        if "curriculum" not in _c_cols:
+            cur.execute("ALTER TABLE classes ADD COLUMN curriculum TEXT")
+    except Exception:
+        pass
     # Ensure questions has open_url and text_snippet
     cols = [r[1] for r in cur.execute("PRAGMA table_info(questions)").fetchall()]
     if "open_url" not in cols:
@@ -222,6 +230,7 @@ class RecommendationOut(BaseModel):
 
 class ClassIn(BaseModel):
     name: str = Field(min_length=1)
+    curriculum: Optional[List[str]] = None
 
 class StudentIn(BaseModel):
     student_id: str = Field(min_length=1)
@@ -283,8 +292,17 @@ def post_attempt(a: AttemptIn):
 @app.get("/classes")
 def list_classes():
     conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row; cur = conn.cursor()
-    cur.execute("SELECT c.id, c.name, COALESCE(cnt.cnt,0) AS student_count FROM classes c LEFT JOIN (SELECT class_id, COUNT(1) AS cnt FROM students GROUP BY class_id) cnt ON c.id = cnt.class_id ORDER BY c.name")
+    cur.execute("SELECT c.id, c.name, c.curriculum, COALESCE(cnt.cnt,0) AS student_count FROM classes c LEFT JOIN (SELECT class_id, COUNT(1) AS cnt FROM students GROUP BY class_id) cnt ON c.id = cnt.class_id ORDER BY c.name")
     rows = [dict(r) for r in cur.fetchall()]
+    for r in rows:
+        curj = r.get("curriculum")
+        if curj:
+            try:
+                r["curriculum"] = json.loads(curj) or []
+            except Exception:
+                r["curriculum"] = []
+        else:
+            r["curriculum"] = []
     conn.close()
     return rows
 
@@ -293,14 +311,17 @@ def create_class(payload: ClassIn):
     conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
     try:
         ts = datetime.datetime.utcnow().isoformat()
-        cur.execute("INSERT INTO classes(name, created_at) VALUES(?, ?)", (payload.name.strip(), ts))
+        weeks = None
+        if payload.curriculum is not None:
+            weeks = [str(x) for x in list(payload.curriculum)][:25]
+        cur.execute("INSERT INTO classes(name, created_at, curriculum) VALUES(?, ?, ?)", (payload.name.strip(), ts, json.dumps(weeks) if weeks is not None else None))
         cid = cur.lastrowid
         conn.commit()
     except sqlite3.IntegrityError:
         conn.close()
         raise HTTPException(status_code=409, detail="Class already exists")
     conn.close()
-    return {"id": cid, "name": payload.name}
+    return {"id": cid, "name": payload.name, "curriculum": weeks or []}
 
 @app.delete("/classes/{class_id}")
 def delete_class(class_id: int):
@@ -310,6 +331,32 @@ def delete_class(class_id: int):
     cur.execute("DELETE FROM classes WHERE id = ?", (class_id,))
     conn.commit(); conn.close()
     return {"ok": True}
+
+class CurriculumIn(BaseModel):
+    weeks: List[str]
+
+@app.get("/classes/{class_id}/curriculum")
+def get_class_curriculum(class_id: int):
+    conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row; cur = conn.cursor()
+    cur.execute("SELECT curriculum FROM classes WHERE id=?", (class_id,))
+    row = cur.fetchone(); conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Class not found")
+    try:
+        weeks = json.loads(row["curriculum"]) if row["curriculum"] else []
+    except Exception:
+        weeks = []
+    return {"id": class_id, "weeks": weeks}
+
+@app.put("/classes/{class_id}/curriculum")
+def update_class_curriculum(class_id: int, payload: CurriculumIn):
+    weeks = [str(x) for x in (payload.weeks or [])][:25]
+    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+    cur.execute("UPDATE classes SET curriculum=? WHERE id=?", (json.dumps(weeks), class_id))
+    if cur.rowcount == 0:
+        conn.close(); raise HTTPException(status_code=404, detail="Class not found")
+    conn.commit(); conn.close()
+    return {"ok": True, "id": class_id, "weeks": weeks}
 
 @app.get("/classes/{class_id}/students")
 def list_class_students(class_id: int):

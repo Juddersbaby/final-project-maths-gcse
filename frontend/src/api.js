@@ -11,7 +11,7 @@ export async function getRecommendation(studentId, k = 3, policy = 'baseline') {
 
 // Classes & Students
 export async function listClasses() { return axios.get(`${API_BASE}/classes`).then(r => r.data); }
-export async function createClass(name) { return axios.post(`${API_BASE}/classes`, { name }).then(r => r.data); }
+export async function createClass(name, curriculum) { return axios.post(`${API_BASE}/classes`, { name, curriculum }).then(r => r.data); }
 export async function deleteClass(id) { return axios.delete(`${API_BASE}/classes/${id}`).then(r => r.data); }
 export async function listClassStudents(classId) { return axios.get(`${API_BASE}/classes/${classId}/students`).then(r => r.data); }
 export async function addStudentToClass(classId, student_id, name) { return axios.post(`${API_BASE}/classes/${classId}/students`, { student_id, name }).then(r => r.data); }
@@ -23,3 +23,6 @@ export async function uploadStudentCSV(student_id, file) {
     headers: { 'Content-Type': 'multipart/form-data' },
   }).then(r => r.data);
 }
+// Curriculum helpers
+export async function getClassCurriculum(classId) { return axios.get(`${API_BASE}/classes/${classId}/curriculum`).then(r => r.data); }
+export async function updateClassCurriculum(classId, weeks) { return axios.put(`${API_BASE}/classes/${classId}/curriculum`, { weeks }).then(r => r.data); }

@@ -17,6 +17,7 @@ export default function App() {
   const [view, setView] = useState('class');
   const [classes, setClasses] = useState([]);
   const [newClassName, setNewClassName] = useState('');
+  const [curriculumWeeks, setCurriculumWeeks] = useState(Array.from({ length: 25 }, () => ''));
   const [activeClass, setActiveClass] = useState(null);
   const [students, setStudents] = useState([]);
   const [newStudentId, setNewStudentId] = useState('');
@@ -39,9 +40,13 @@ export default function App() {
   const handleCreateClass = async () => {
     if (!newClassName.trim()) return;
     try {
-      const c = await createClass(newClassName.trim());
+      // Build curriculum: include only weeks where a topic was selected
+      const weeks = curriculumWeeks.map(w => (w && w.trim()) ? w.trim() : '').slice(0, 25);
+      const nonEmptyWeeks = weeks.map(x => x || '').slice(0, 25);
+      const c = await createClass(newClassName.trim(), nonEmptyWeeks);
       setClasses([...(classes || []), { id: c.id, name: c.name, student_count: 0 }]);
       setNewClassName('');
+      setCurriculumWeeks(Array.from({ length: 25 }, () => ''));
     } catch (e) { alert('Failed to create class'); }
   };
 
@@ -109,9 +114,31 @@ export default function App() {
           {view === 'class' && (
             <div className="bg-white rounded-2xl shadow p-6 space-y-4">
               <h3 className="text-xl font-semibold">Your Classes</h3>
-              <div className="flex gap-2">
-                <input className="border rounded px-3 py-2 flex-1" placeholder="New class name" value={newClassName} onChange={e => setNewClassName(e.target.value)} />
-                <button className="px-3 py-2 rounded bg-blue-600 text-white" onClick={handleCreateClass}>Add</button>
+              <div className="space-y-3">
+                <div className="flex gap-2">
+                  <input className="border rounded px-3 py-2 flex-1" placeholder="New class name" value={newClassName} onChange={e => setNewClassName(e.target.value)} />
+                  <button className="px-3 py-2 rounded bg-blue-600 text-white" onClick={handleCreateClass}>Add</button>
+                </div>
+                <div className="border rounded p-3">
+                  <div className="text-sm font-medium mb-2">Set weekly topics (select the topic covered for each week; repeats allowed)</div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
+                    {curriculumWeeks.map((val, idx) => (
+                      <div key={idx} className="flex items-center gap-2">
+                        <label className="w-20 text-xs text-gray-600">Week {idx + 1}</label>
+                        <select className="border rounded px-2 py-1 flex-1" value={val} onChange={e => {
+                          const copy = [...curriculumWeeks];
+                          copy[idx] = e.target.value;
+                          setCurriculumWeeks(copy);
+                        }}>
+                          <option value="">-- Select Topic --</option>
+                          {topics.map(t => (
+                            <option key={t.topic} value={t.topic}>{t.topic}</option>
+                          ))}
+                        </select>
+                      </div>
+                    ))}
+                  </div>
+                </div>
               </div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 {(classes || []).map(c => (
