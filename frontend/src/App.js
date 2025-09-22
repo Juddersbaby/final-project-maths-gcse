@@ -17,7 +17,7 @@ export default function App() {
   const [view, setView] = useState('class');
   const [classes, setClasses] = useState([]);
   const [newClassName, setNewClassName] = useState('');
-  const [curriculumWeeks, setCurriculumWeeks] = useState(Array.from({ length: 25 }, () => ''));
+  const [curriculumWeeks, setCurriculumWeeks] = useState(['']); // start with Week 1 only
   const [activeClass, setActiveClass] = useState(null);
   const [students, setStudents] = useState([]);
   const [newStudentId, setNewStudentId] = useState('');
@@ -41,12 +41,13 @@ export default function App() {
     if (!newClassName.trim()) return;
     try {
       // Build curriculum: include only weeks where a topic was selected
+      // Require Week 1 selection; allow empty for additional weeks
+      if (!curriculumWeeks[0] || !curriculumWeeks[0].trim()) { alert('Please select a topic for Week 1'); return; }
       const weeks = curriculumWeeks.map(w => (w && w.trim()) ? w.trim() : '').slice(0, 25);
-      const nonEmptyWeeks = weeks.map(x => x || '').slice(0, 25);
-      const c = await createClass(newClassName.trim(), nonEmptyWeeks);
+      const c = await createClass(newClassName.trim(), weeks);
       setClasses([...(classes || []), { id: c.id, name: c.name, student_count: 0 }]);
       setNewClassName('');
-      setCurriculumWeeks(Array.from({ length: 25 }, () => ''));
+      setCurriculumWeeks(['']);
     } catch (e) { alert('Failed to create class'); }
   };
 
@@ -120,16 +121,30 @@ export default function App() {
                   <button className="px-3 py-2 rounded bg-blue-600 text-white" onClick={handleCreateClass}>Add</button>
                 </div>
                 <div className="border rounded p-3">
-                  <div className="text-sm font-medium mb-2">Set weekly topics (select the topic covered for each week; repeats allowed)</div>
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="text-sm font-medium">Set weekly topics (Week 1 required; add weeks as needed)</div>
+                    <div className="space-x-2">
+                      <button type="button" className="px-2 py-1 text-sm rounded border"
+                        onClick={() => {
+                          if (curriculumWeeks.length < 25) setCurriculumWeeks([...curriculumWeeks, '']);
+                        }}>+ Week</button>
+                      <button type="button" className="px-2 py-1 text-sm rounded border"
+                        onClick={() => {
+                          if (curriculumWeeks.length > 1) setCurriculumWeeks(curriculumWeeks.slice(0, -1));
+                        }}>Remove last</button>
+                    </div>
+                  </div>
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
                     {curriculumWeeks.map((val, idx) => (
                       <div key={idx} className="flex items-center gap-2">
                         <label className="w-20 text-xs text-gray-600">Week {idx + 1}</label>
-                        <select className="border rounded px-2 py-1 flex-1" value={val} onChange={e => {
-                          const copy = [...curriculumWeeks];
-                          copy[idx] = e.target.value;
-                          setCurriculumWeeks(copy);
-                        }}>
+                        <select className={`border rounded px-2 py-1 flex-1 ${idx===0 && (!val||!val.trim()) ? 'border-red-500' : ''}`}
+                          value={val}
+                          onChange={e => {
+                            const copy = [...curriculumWeeks];
+                            copy[idx] = e.target.value;
+                            setCurriculumWeeks(copy);
+                          }}>
                           <option value="">-- Select Topic --</option>
                           {topics.map(t => (
                             <option key={t.topic} value={t.topic}>{t.topic}</option>
