@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { getHealth, getTopics, postAttempt, getRecommendation, listClasses, createClass, deleteClass, listClassStudents, addStudentToClass, removeStudentFromClass, uploadStudentCSV, getClassCurriculum, updateClassCurriculum } from './api';
+import { getHealth, getTopics, postAttempt, getRecommendation, listClasses, createClass, deleteClass, listClassStudents, addStudentToClass, removeStudentFromClass, uploadStudentCSV, getClassCurriculum, updateClassCurriculum, listPapers, listQuestions, ingestPaper } from './api';
 import ClassView from './components/ClassView';
 import StudentView from './components/StudentView';
 
@@ -27,12 +27,27 @@ export default function App() {
   const [currentCurriculum, setCurrentCurriculum] = useState([]); // read-only display of weeks
   const [editWeeks, setEditWeeks] = useState(['']); // editable weeks state
   const [savingCurr, setSavingCurr] = useState(false);
+  // Papers & ingestion
+  const [papers, setPapers] = useState([]);
+  const [papersLoading, setPapersLoading] = useState(false);
+  const [ingestUrl, setIngestUrl] = useState('');
+  const [ingesting, setIngesting] = useState(false);
+  const [selectedPaperId, setSelectedPaperId] = useState(null);
+  const [paperQuestions, setPaperQuestions] = useState([]);
 
   useEffect(() => {
     getHealth().then(setStatus).catch(() => setStatus({ ok: false }));
     getTopics().then((t) => { setTopics(t); if (t?.length) setSelTopic(t[0].topic); });
     // Load classes
     listClasses().then(setClasses).catch(() => { });
+    // Load papers (Edexcel, all tiers)
+    (async () => {
+      try {
+        setPapersLoading(true);
+        const p = await listPapers('Edexcel');
+        setPapers(p || []);
+      } catch { setPapers([]); } finally { setPapersLoading(false); }
+    })();
   }, []);
 
   const openClass = async (c) => {
@@ -99,6 +114,33 @@ export default function App() {
     // Restore edit form to current curriculum (or Week 1 blank)
     const weeks = (currentCurriculum || []).slice(0, 25);
     setEditWeeks(weeks.length > 0 ? weeks : ['']);
+  };
+
+  // Papers & ingestion handlers
+  const handleIngest = async () => {
+    if (!ingestUrl.trim()) return;
+    try {
+      setIngesting(true);
+      const res = await ingestPaper(ingestUrl.trim());
+      alert(`Ingested Paper ${res.paper_no} (${res.series}, ${res.tier}) with ${res.inserted} questions.`);
+      setIngestUrl('');
+      // refresh papers
+      try { setPapersLoading(true); const p = await listPapers('Edexcel'); setPapers(p||[]); } finally { setPapersLoading(false); }
+    } catch (e) {
+      alert('Failed to ingest paper');
+    } finally {
+      setIngesting(false);
+    }
+  };
+  const toggleQuestions = async (paper) => {
+    if (selectedPaperId === paper.id) {
+      setSelectedPaperId(null); setPaperQuestions([]); return;
+    }
+    setSelectedPaperId(paper.id); setPaperQuestions([]);
+    try {
+      const qs = await listQuestions(paper.id);
+      setPaperQuestions(qs || []);
+    } catch { setPaperQuestions([]); }
   };
 
   const handleAddStudent = async () => {
@@ -197,6 +239,52 @@ export default function App() {
                         </select>
                       </div>
                     ))}
+                  </div>
+                </div>
+
+                {/* Papers ingestion */}
+                <div className="border rounded p-3 space-y-2">
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="text-sm font-medium">Ingest Past Paper (MathsGenie URL)</div>
+                  </div>
+                  <div className="flex gap-2">
+                    <input className="border rounded px-3 py-2 flex-1" placeholder="https://www.mathsgenie.co.uk/papers/1fnov2023.pdf" value={ingestUrl} onChange={e=>setIngestUrl(e.target.value)} />
+                    <button className="px-3 py-2 rounded bg-emerald-600 text-white" onClick={handleIngest} disabled={ingesting}>{ingesting? 'Ingesting...' : 'Ingest'}</button>
+                  </div>
+                  <div className="mt-2">
+                    <div className="text-sm font-medium mb-1">Papers {papersLoading && <span className="text-gray-500">(loading...)</span>}</div>
+                    <div className="space-y-2 max-h-64 overflow-auto">
+                      {(papers||[]).map(p => (
+                        <div key={p.id} className="border rounded p-2 bg-white">
+                          <div className="flex items-center justify-between">
+                            <div className="text-sm">
+                              <span className="font-medium">{p.series}</span> — {p.tier} — Paper {p.paper_no} {p.calculator ? '(Calc)' : ''}
+                            </div>
+                            <div className="space-x-2">
+                              <a href={p.pdf_url} target="_blank" rel="noreferrer" className="text-blue-600 underline text-sm">Open PDF</a>
+                              <button className="px-2 py-1 text-xs rounded border" onClick={()=>toggleQuestions(p)}>{selectedPaperId===p.id ? 'Hide Questions' : 'Show Questions'}</button>
+                            </div>
+                          </div>
+                          {selectedPaperId===p.id && (
+                            <div className="mt-2 text-xs">
+                              {(paperQuestions||[]).length===0 ? (
+                                <div className="text-gray-600">No questions or failed to load.</div>
+                              ) : (
+                                <ul className="list-disc pl-5 space-y-1">
+                                  {paperQuestions.map(q => (
+                                    <li key={q.id}>
+                                      Q{q.qno} ({q.marks} marks) — {q.topic || 'Unknown'} —
+                                      {' '}<a className="text-blue-600 underline" href={`${p.pdf_url}#page=${q.page_start || 1}`} target="_blank" rel="noreferrer">open</a>
+                                    </li>
+                                  ))}
+                                </ul>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                      {(!papers || papers.length===0) && <div className="text-sm text-gray-600">No papers yet.</div>}
+                    </div>
                   </div>
                 </div>
               </div>

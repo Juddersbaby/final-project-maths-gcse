@@ -11,6 +11,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from fastapi import Query
+import requests, io, pdfplumber
 import json
 import logging, traceback
 logger = logging.getLogger("uvicorn.error")
@@ -272,6 +273,85 @@ def list_questions(paper_id: int = Query(..., description="papers.id to fetch"))
     for r in out:
         r["open_url"] = f"{base}#page={r['page_start']}"
     return out
+
+# ---------- Paper ingestion (from PDF URL) ----------
+class IngestIn(BaseModel):
+    url: str
+    board: Optional[str] = "Edexcel"
+    markscheme_url: Optional[str] = None
+
+@app.post("/ingest_paper")
+def ingest_paper(payload: IngestIn):
+    try:
+        # Lazy import to avoid circulars if any
+        from backend import ingest_paper as ing
+    except Exception:
+        raise HTTPException(status_code=500, detail="Ingest module not available")
+
+    meta = ing.parse_series_from_url(payload.url)
+    if not meta:
+        raise HTTPException(status_code=400, detail="Could not parse tier/series/paper from URL. Expected /<num><f|h><month><year>.pdf")
+    paper_no, tier, series, calculator, year = meta
+
+    # Download PDF
+    try:
+        r = requests.get(payload.url, timeout=60)
+        r.raise_for_status()
+        pdf_bytes = r.content
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch PDF: {e}")
+
+    ranges = ing.extract_questions(pdf_bytes)
+    if not ranges:
+        raise HTTPException(status_code=422, detail="No question markers found in PDF (image-only or unknown format)")
+
+    # Insert into DB
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        ing.ensure_schema(conn)
+        paper_id = ing.add_paper(conn, payload.board or "Edexcel", tier, series, paper_no, calculator, year, payload.url, payload.markscheme_url)
+
+        # Extract snippets and insert questions
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            cur = conn.cursor()
+            inserted = 0
+            for (qno, marks, ps, pe) in ranges:
+                pages_text = []
+                for p in range(ps, pe+1):
+                    pages_text.append(pdf.pages[p-1].extract_text() or "")
+                raw = " ".join(pages_text)
+                snippet = ing.compact(ing.clean_text(raw))
+                topic = ing.guess_topic(snippet)
+                diff = 1 if marks <= 2 else (2 if marks <= 4 else 3)
+                cur.execute(
+                    """
+                    INSERT OR REPLACE INTO questions
+                    (paper_id,qno,marks,page_start,page_end,topic,difficulty,text_snippet)
+                    VALUES(?,?,?,?,?,?,?,?)
+                    """,
+                    (paper_id, qno, marks, ps, pe, topic, diff, snippet)
+                )
+                inserted += 1
+            conn.commit()
+    finally:
+        conn.close()
+
+    # Rebuild TF-IDF index for questions
+    try:
+        build_tfidf_questions()
+    except Exception:
+        MODELS['tfidf'] = None
+
+    return {
+        "ok": True,
+        "paper_id": paper_id,
+        "series": series,
+        "tier": tier,
+        "paper_no": paper_no,
+        "calculator": calculator,
+        "year": year,
+        "inserted": len(ranges)
+    }
 
 # ---------- Attempts & Recommenders  ----------
 @app.post("/attempt")

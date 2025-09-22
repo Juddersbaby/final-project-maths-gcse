@@ -26,3 +26,15 @@ export async function uploadStudentCSV(student_id, file) {
 // Curriculum helpers
 export async function getClassCurriculum(classId) { return axios.get(`${API_BASE}/classes/${classId}/curriculum`).then(r => r.data); }
 export async function updateClassCurriculum(classId, weeks) { return axios.put(`${API_BASE}/classes/${classId}/curriculum`, { weeks }).then(r => r.data); }
+
+// Papers & ingestion
+export async function listPapers(board = 'Edexcel', tier) {
+  const params = tier ? { board, tier } : { board };
+  return axios.get(`${API_BASE}/papers`, { params }).then(r => r.data);
+}
+export async function listQuestions(paper_id) {
+  return axios.get(`${API_BASE}/questions`, { params: { paper_id } }).then(r => r.data);
+}
+export async function ingestPaper(url, board = 'Edexcel', markscheme_url = null) {
+  return axios.post(`${API_BASE}/ingest_paper`, { url, board, markscheme_url }).then(r => r.data);
+}
