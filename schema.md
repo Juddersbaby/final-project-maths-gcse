@@ -95,3 +95,76 @@ Notes: Students optionally linked to a class.
 ## Source
 - Core DDL: `backend/main.py` (init_db, migrate_schema)
 - Ingestion DDL: `backend/ingest_paper.py` (ensure_schema)
+
+## ER diagram
+
+```mermaid
+erDiagram
+		CLASSES ||--o{ STUDENTS : includes
+		STUDENTS ||--o{ ATTEMPTS : logs
+		PAPERS ||--o{ QUESTIONS : contains
+		STUDENTS ||--o{ AB_LOG : served
+
+		CLASSES {
+			INTEGER id PK
+			TEXT name UNIQUE
+			TEXT created_at
+			TEXT curriculum JSON
+		}
+
+		STUDENTS {
+			INTEGER id PK
+			TEXT student_id UNIQUE
+			TEXT name
+			INTEGER class_id FK
+			TEXT created_at
+		}
+
+		ATTEMPTS {
+			INTEGER id PK
+			TEXT student_id
+			TEXT topic
+			INTEGER difficulty
+			INTEGER correct
+			TEXT ts
+		}
+
+		PAPERS {
+			INTEGER id PK
+			TEXT board
+			TEXT tier
+			TEXT series
+			INTEGER paper_no
+			INTEGER calculator
+			INTEGER year
+			TEXT pdf_url
+			TEXT markscheme_url
+		}
+
+		QUESTIONS {
+			INTEGER id PK
+			INTEGER paper_id FK
+			INTEGER qno
+			INTEGER marks
+			INTEGER page_start
+			INTEGER page_end
+			TEXT topic
+			INTEGER difficulty
+			TEXT open_url
+			TEXT text_snippet
+		}
+
+		AB_LOG {
+			INTEGER id PK
+			TEXT student_id
+			TEXT policy
+			INTEGER k
+			TEXT payload
+			TEXT ts
+		}
+```
+
+Notes:
+- Relationships from `ATTEMPTS.student_id` and `AB_LOG.student_id` to `STUDENTS.student_id` are logical (not enforced by SQLite FKs).
+- `STUDENTS.class_id` references `CLASSES.id` (enforced by FK).
+- `QUESTIONS.paper_id` references `PAPERS.id` (enforced by FK).
