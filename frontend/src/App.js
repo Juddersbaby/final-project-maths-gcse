@@ -213,21 +213,27 @@ export default function App() {
     } catch { }
   };
 
-  const openStudentDetail = async (s) => {
-    setDetailStudent(s);
-    setView('studentDetail');
+  const refreshStudentDetail = async (studentIdParam) => {
+    const sid = studentIdParam || detailStudent?.student_id;
+    if (!sid) return;
     setDetailAttempts([]); setDetailRecs([]);
     try {
       setDetailLoading(true);
       const [atts, recs] = await Promise.all([
-        listStudentAttempts(s.student_id, 100),
-        getRecommendation(s.student_id, 3, policy)
+        listStudentAttempts(sid, 100),
+        getRecommendation(sid, 3, policy)
       ]);
       setDetailAttempts(atts || []);
       setDetailRecs(recs?.next_topics || []);
     } catch {
       setDetailAttempts([]); setDetailRecs([]);
     } finally { setDetailLoading(false); }
+  };
+
+  const openStudentDetail = async (s) => {
+    setDetailStudent(s);
+    setView('studentDetail');
+    await refreshStudentDetail(s.student_id);
   };
 
   const handleUploadCSV = async (s, file) => {
@@ -503,7 +509,20 @@ export default function App() {
                   <h3 className="text-xl font-semibold">{detailStudent?.student_id}{detailStudent?.name ? ` - ${detailStudent.name}` : ''}</h3>
                   <div className="text-sm text-gray-600">Class: {activeClass?.name}</div>
                 </div>
-                <div>
+                <div className="space-x-2">
+                  <button onClick={() => refreshStudentDetail()} className="px-3 py-1 rounded border">Refresh</button>
+                  <label className="px-3 py-1 border rounded cursor-pointer">
+                    <input type="file" accept=".csv" className="hidden" onChange={e => detailStudent && handleUploadCSV({ student_id: detailStudent.student_id }, e.target.files[0])} />
+                    Upload CSV
+                  </label>
+                  <button className="px-3 py-1 border rounded" onClick={async () => {
+                    try {
+                      const resp = await fetch('/sample_student_results.csv');
+                      const blob = await resp.blob();
+                      const file = new File([blob], 'sample_student_results.csv', { type: 'text/csv' });
+                      if (detailStudent) await handleUploadCSV({ student_id: detailStudent.student_id }, file);
+                    } catch {}
+                  }}>Demo Upload</button>
                   <button onClick={() => setView('students')} className="px-3 py-1 rounded border">Back</button>
                 </div>
               </div>
@@ -512,12 +531,12 @@ export default function App() {
                 <div className="border rounded p-4">
                   <h4 className="font-medium mb-2">Results</h4>
                   {detailLoading && <div className="text-sm text-gray-600">Loading...</div>}
-                  {(!detailLoading && (!detailAttempts || detailAttempts.length===0)) && <div className="text-sm text-gray-600">No attempts yet.</div>}
-                  {detailAttempts && detailAttempts.length>0 && (
+                  {(!detailLoading && (!detailAttempts || detailAttempts.length === 0)) && <div className="text-sm text-gray-600">No attempts yet.</div>}
+                  {detailAttempts && detailAttempts.length > 0 && (
                     <ul className="text-sm divide-y">
                       {detailAttempts.map((a, i) => (
                         <li key={i} className="py-1 flex items-center justify-between">
-                          <span>{a.ts?.slice(0,19).replace('T',' ')} — {a.topic} — Diff {a.difficulty}</span>
+                          <span>{a.ts?.slice(0, 19).replace('T', ' ')} — {a.topic} — Diff {a.difficulty}</span>
                           <span className={a.correct ? 'text-emerald-600' : 'text-red-600'}>{a.correct ? 'Correct' : 'Incorrect'}</span>
                         </li>
                       ))}
@@ -527,8 +546,8 @@ export default function App() {
                 <div className="border rounded p-4">
                   <h4 className="font-medium mb-2">Recommendations</h4>
                   {detailLoading && <div className="text-sm text-gray-600">Loading...</div>}
-                  {(!detailLoading && (!detailRecs || detailRecs.length===0)) && <div className="text-sm text-gray-600">No recommendations.</div>}
-                  {detailRecs && detailRecs.length>0 && (
+                  {(!detailLoading && (!detailRecs || detailRecs.length === 0)) && <div className="text-sm text-gray-600">No recommendations.</div>}
+                  {detailRecs && detailRecs.length > 0 && (
                     <ul className="list-disc pl-5 text-sm">
                       {detailRecs.map((r, i) => <li key={i}>{r}</li>)}
                     </ul>
@@ -549,7 +568,7 @@ export default function App() {
             </header>
             <h4 className="text-sm font-medium">Log an attempt</h4>
             <div className="grid grid-cols-1 gap-2">
-              <input className="border rounded px-3 py-2" placeholder="Filter students (ID, name, class)" value={studentFilter} onChange={e=>setStudentFilter(e.target.value)} />
+              <input className="border rounded px-3 py-2" placeholder="Filter students (ID, name, class)" value={studentFilter} onChange={e => setStudentFilter(e.target.value)} />
               <select className="border rounded px-3 py-2"
                 value={studentId}
                 onChange={e => setStudentId(e.target.value)}>
