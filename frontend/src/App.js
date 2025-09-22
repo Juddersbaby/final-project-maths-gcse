@@ -27,37 +27,37 @@ export default function App() {
     getHealth().then(setStatus).catch(() => setStatus({ ok: false }));
     getTopics().then((t) => { setTopics(t); if (t?.length) setSelTopic(t[0].topic); });
     // Load classes
-    listClasses().then(setClasses).catch(()=>{});
+    listClasses().then(setClasses).catch(() => { });
   }, []);
 
   const openClass = async (c) => {
     setActiveClass(c);
     setView('students');
-    try { setStudents(await listClassStudents(c.id)); } catch {}
+    try { setStudents(await listClassStudents(c.id)); } catch { }
   };
 
   const handleCreateClass = async () => {
     if (!newClassName.trim()) return;
     try {
       const c = await createClass(newClassName.trim());
-      setClasses([...(classes||[]), { id: c.id, name: c.name, student_count: 0 }]);
+      setClasses([...(classes || []), { id: c.id, name: c.name, student_count: 0 }]);
       setNewClassName('');
     } catch (e) { alert('Failed to create class'); }
   };
 
   const handleDeleteClass = async (cls) => {
     if (!window.confirm(`Delete class "${cls.name}"?`)) return;
-    try { await deleteClass(cls.id); setClasses((classes||[]).filter(x => x.id !== cls.id)); if (activeClass?.id===cls.id) { setActiveClass(null); setStudents([]); setView('class'); } } catch {}
+    try { await deleteClass(cls.id); setClasses((classes || []).filter(x => x.id !== cls.id)); if (activeClass?.id === cls.id) { setActiveClass(null); setStudents([]); setView('class'); } } catch { }
   };
 
   const handleAddStudent = async () => {
     if (!activeClass) return; if (!newStudentId.trim()) return;
-    try { await addStudentToClass(activeClass.id, newStudentId.trim(), newStudentName.trim()||undefined); setStudents([...(students||[]), { id: Date.now(), student_id: newStudentId.trim(), name: newStudentName.trim(), class_id: activeClass.id }]); setNewStudentId(''); setNewStudentName(''); } catch { alert('Failed to add student'); }
+    try { await addStudentToClass(activeClass.id, newStudentId.trim(), newStudentName.trim() || undefined); setStudents([...(students || []), { id: Date.now(), student_id: newStudentId.trim(), name: newStudentName.trim(), class_id: activeClass.id }]); setNewStudentId(''); setNewStudentName(''); } catch { alert('Failed to add student'); }
   };
 
   const handleRemoveStudent = async (s) => {
     if (!activeClass) return;
-    try { await removeStudentFromClass(activeClass.id, s.student_id); setStudents((students||[]).filter(x => x.student_id !== s.student_id)); } catch {}
+    try { await removeStudentFromClass(activeClass.id, s.student_id); setStudents((students || []).filter(x => x.student_id !== s.student_id)); } catch { }
   };
 
   const handleUploadCSV = async (s, file) => {
@@ -99,8 +99,8 @@ export default function App() {
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Adaptive Quiz Teacher</h1>
         <nav className="space-x-2">
-          <button onClick={() => setView('class')} className={`px-3 py-1 rounded ${view==='class'?'bg-blue-600 text-white':'border'}`}>Class View</button>
-          <button onClick={() => setView('students')} className={`px-3 py-1 rounded ${view==='students'?'bg-blue-600 text-white':'border'}`}>Student View</button>
+          <button onClick={() => setView('class')} className={`px-3 py-1 rounded ${view === 'class' ? 'bg-blue-600 text-white' : 'border'}`}>Class View</button>
+          <button onClick={() => setView('students')} className={`px-3 py-1 rounded ${view === 'students' ? 'bg-blue-600 text-white' : 'border'}`}>Student View</button>
         </nav>
       </div>
 
@@ -110,11 +110,11 @@ export default function App() {
             <div className="bg-white rounded-2xl shadow p-6 space-y-4">
               <h3 className="text-xl font-semibold">Your Classes</h3>
               <div className="flex gap-2">
-                <input className="border rounded px-3 py-2 flex-1" placeholder="New class name" value={newClassName} onChange={e=>setNewClassName(e.target.value)} />
+                <input className="border rounded px-3 py-2 flex-1" placeholder="New class name" value={newClassName} onChange={e => setNewClassName(e.target.value)} />
                 <button className="px-3 py-2 rounded bg-blue-600 text-white" onClick={handleCreateClass}>Add</button>
               </div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {(classes||[]).map(c => (
+                {(classes || []).map(c => (
                   <div key={c.id} className="border rounded p-4 bg-gray-50 flex items-center justify-between">
                     <div>
                       <div className="font-medium">{c.name}</div>
@@ -126,7 +126,7 @@ export default function App() {
                     </div>
                   </div>
                 ))}
-                {(!classes || classes.length===0) && <div className="text-sm text-gray-600">No classes yet.</div>}
+                {(!classes || classes.length === 0) && <div className="text-sm text-gray-600">No classes yet.</div>}
               </div>
             </div>
           )}
@@ -136,21 +136,24 @@ export default function App() {
               <div className="flex items-center justify-between">
                 <div>
                   <h3 className="text-xl font-semibold">{activeClass?.name || 'Class'}</h3>
-                  <div className="text-sm text-gray-600">Manage students and upload results CSV per student.</div>
+                  <div className="text-sm text-gray-600 flex flex-col md:flex-row md:items-center gap-2">
+                    <span>Manage students and upload results CSV per student.</span>
+                    <a href="/sample_student_results.csv" download className="text-blue-600 underline">Download sample CSV</a>
+                  </div>
                 </div>
                 <div className="space-x-2">
-                  <button onClick={()=>setView('class')} className="px-3 py-1 rounded border">Back</button>
+                  <button onClick={() => setView('class')} className="px-3 py-1 rounded border">Back</button>
                 </div>
               </div>
 
               <div className="flex gap-2">
-                <input className="border rounded px-3 py-2" placeholder="Student ID" value={newStudentId} onChange={e=>setNewStudentId(e.target.value)} />
-                <input className="border rounded px-3 py-2 flex-1" placeholder="Name (optional)" value={newStudentName} onChange={e=>setNewStudentName(e.target.value)} />
+                <input className="border rounded px-3 py-2" placeholder="Student ID" value={newStudentId} onChange={e => setNewStudentId(e.target.value)} />
+                <input className="border rounded px-3 py-2 flex-1" placeholder="Name (optional)" value={newStudentName} onChange={e => setNewStudentName(e.target.value)} />
                 <button onClick={handleAddStudent} className="px-3 py-2 rounded bg-blue-600 text-white">Add Student</button>
               </div>
 
               <div className="space-y-2">
-                {(students||[]).map(s => (
+                {(students || []).map(s => (
                   <div key={s.student_id} className="flex items-center justify-between border rounded p-3 bg-white">
                     <div>
                       <div className="font-medium">{s.student_id}{s.name ? ` - ${s.name}` : ''}</div>
@@ -161,11 +164,19 @@ export default function App() {
                         <input type="file" accept=".csv" className="hidden" onChange={e => handleUploadCSV(s, e.target.files[0])} />
                         {csvUploading ? 'Uploading...' : 'Upload CSV'}
                       </label>
-                      <button className="px-3 py-1 border rounded" onClick={()=>handleRemoveStudent(s)}>Remove</button>
+                      <button className="px-3 py-1 border rounded" onClick={async ()=>{
+                        try {
+                          const resp = await fetch('/sample_student_results.csv');
+                          const blob = await resp.blob();
+                          const file = new File([blob], 'sample_student_results.csv', { type: 'text/csv' });
+                          await handleUploadCSV(s, file);
+                        } catch {}
+                      }}>Demo Upload</button>
+                      <button className="px-3 py-1 border rounded" onClick={() => handleRemoveStudent(s)}>Remove</button>
                     </div>
                   </div>
                 ))}
-                {(!students || students.length===0) && <div className="text-sm text-gray-600">No students yet.</div>}
+                {(!students || students.length === 0) && <div className="text-sm text-gray-600">No students yet.</div>}
               </div>
             </div>
           )}
@@ -214,7 +225,7 @@ export default function App() {
             </div>
             {recs.length > 0 && (
               <ul className="mt-2 list-disc pl-5 text-sm">
-                {recs.map((r,i) => <li key={i}>{r}</li>)}
+                {recs.map((r, i) => <li key={i}>{r}</li>)}
               </ul>
             )}
           </div>
