@@ -211,10 +211,21 @@ def ensure_tfidf():
 
 
 app = FastAPI(title="Adaptive Quiz API", version="0.3.0")
+
+# Allow common local dev origins (3000/3001). For production, tighten this or make it env-driven.
+ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3001",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000","http://127.0.0.1:3000"],
-    allow_methods=["*"], allow_headers=["*"], allow_credentials=False
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=False,
 )
 
 class AttemptIn(BaseModel):
