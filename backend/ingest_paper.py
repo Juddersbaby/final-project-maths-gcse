@@ -88,27 +88,36 @@ def parse_series_from_url(url: str):
     return paper_no, tier, series, calculator, year
 
 def extract_questions(pdf_bytes: bytes):
-    """Return list of (qno, marks, end_page). Start pages inferred sequentially."""
-    prev_end = None
-for (qno, marks, end_page) in hits:
-    start = (prev_end + 1) if prev_end is not None else end_page   # start first at its end page
-    ranges.append((qno, marks, start, end_page))
-    prev_end = end_page
+    """Return list of (qno, marks, page_start, page_end).
+       First question start is clamped to its end page; others follow sequentially."""
     hits = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for i, page in enumerate(pdf.pages, start=1):
             text = page.extract_text() or ""
             for qno, marks in re.findall(r"Total\s+for\s+Question\s+(\d+)\s+is\s+(\d+)\s+mark", text, flags=re.I):
-                hits.append((int(qno), int(marks), i))
+                hits.append((int(qno), int(marks), i))  # (qno, marks, end_page)
+
     if not hits:
         return []
+
     hits.sort(key=lambda x: x[0])
-    ranges, prev_end = [], 1
+    ranges = []
+    prev_end = None
     for (qno, marks, end_page) in hits:
-        start = prev_end if prev_end <= end_page else end_page
+        if prev_end is None:
+            # First question: start on the page where its "Total for Question ..." appears
+            start = end_page
+        else:
+            # Subsequent questions start on the page after the previous question's end
+            start = prev_end + 1
+            if start > end_page:
+                # Safety: never start after the end page
+                start = end_page
         ranges.append((qno, marks, start, end_page))
-        prev_end = end_page + 1
+        prev_end = end_page
+
     return ranges
+
 
 def compact(text: str, limit=600):
     t = " ".join((text or "").split())

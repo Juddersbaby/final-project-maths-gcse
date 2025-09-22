@@ -2,21 +2,15 @@ import sqlite3, re
 
 # same CLEAN_PATTERNS and clean_text as in the ingester
 CLEAN_PATTERNS = [
-    r"\*P\d{5}A\d{3,4}\*",                # e.g. *P69525A0224*
-    r"DO NOT WRITE IN THIS AREA",         # repeated frames
-    r"AERA SIHT NI ETIRW TON OD",         # mirrored text
-    r"Turn over",                         # pagination
-    r"TOTAL FOR PAPER IS \d+ MARKS",
-    r"Please check the examination details.*?You must have:.*?Instructions",  # cover blurb
+    r"\*P\d{5}A\d{3,4}\*", r"DO NOT WRITE IN THIS AREA", r"AERA SIHT NI ETIRW TON OD",
+    r"Turn over", r"TOTAL FOR PAPER IS \d+ MARKS",
+    r"Please check the examination details.*?You must have:.*?Instructions",
 ]
-
 def clean_text(t: str) -> str:
     if not t: return ""
     for pat in CLEAN_PATTERNS:
         t = re.sub(pat, " ", t, flags=re.IGNORECASE | re.DOTALL)
-    # collapse whitespace
-    t = " ".join(t.split())
-    return t
+    return " ".join(t.split())
 
 TOPIC_RULES = {
     "Algebra": ["simplify","expand","factor","solve","equation","simultaneous","indices","powers","substitute","collect like terms"],
