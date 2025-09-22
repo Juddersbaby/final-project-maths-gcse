@@ -530,7 +530,7 @@ export default function App() {
                       const blob = await resp.blob();
                       const file = new File([blob], 'sample_student_results.csv', { type: 'text/csv' });
                       if (detailStudent) await handleUploadCSV({ student_id: detailStudent.student_id }, file);
-                    } catch {}
+                    } catch { }
                   }}>Demo Upload</button>
                   <button onClick={() => setView('students')} className="px-3 py-1 rounded border">Back</button>
                 </div>
