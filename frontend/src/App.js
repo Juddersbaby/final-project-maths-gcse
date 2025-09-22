@@ -86,10 +86,11 @@ export default function App() {
   // Default the selected student to the first available if current selection is not in the list
   useEffect(() => {
     if (!allStudents || allStudents.length === 0) return;
-    if (!allStudents.some(s => s.student_id === studentId)) {
+    // Only set a default if none is selected yet; don't override an existing choice
+    if (!studentId) {
       setStudentId(allStudents[0].student_id);
     }
-  }, [allStudents]);
+  }, [allStudents, studentId]);
 
   const filteredStudents = React.useMemo(() => {
     const q = (studentFilter || '').toLowerCase();
@@ -232,6 +233,8 @@ export default function App() {
 
   const openStudentDetail = async (s) => {
     setDetailStudent(s);
+    // Also bind Control Panel selection to this student so new attempts save to them
+    setStudentId(s.student_id);
     setView('studentDetail');
     await refreshStudentDetail(s.student_id);
   };
@@ -240,7 +243,13 @@ export default function App() {
     if (!file) return; setCsvUploading(true);
     try { const res = await uploadStudentCSV(s.student_id, file); alert(`Uploaded ${res.inserted} rows`); }
     catch { alert('Upload failed'); }
-    finally { setCsvUploading(false); }
+    finally {
+      setCsvUploading(false);
+      // If we're in the detail view for this student, refresh results/recs
+      if (detailStudent && s.student_id === detailStudent.student_id) {
+        refreshStudentDetail(detailStudent.student_id);
+      }
+    }
   };
 
   const submitAttempt = async () => {
