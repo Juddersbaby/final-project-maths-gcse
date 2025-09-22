@@ -27,6 +27,9 @@ export default function App() {
   const [currentCurriculum, setCurrentCurriculum] = useState([]); // read-only display of weeks
   const [editWeeks, setEditWeeks] = useState(['']); // editable weeks state
   const [savingCurr, setSavingCurr] = useState(false);
+  // All students (for Control Panel dropdown)
+  const [allStudents, setAllStudents] = useState([]);
+  const [allStudentsLoading, setAllStudentsLoading] = useState(false);
   // Papers & ingestion
   const [papers, setPapers] = useState([]);
   const [papersLoading, setPapersLoading] = useState(false);
@@ -49,6 +52,38 @@ export default function App() {
       } catch { setPapers([]); } finally { setPapersLoading(false); }
     })();
   }, []);
+
+  // When classes change, load all students across classes for the Control Panel
+  useEffect(() => {
+    const loadAll = async () => {
+      try {
+        setAllStudentsLoading(true);
+        const cls = classes || [];
+        const lists = await Promise.all(cls.map(async (c) => {
+          try {
+            const st = await listClassStudents(c.id);
+            return (st || []).map(s => ({ ...s, class_name: c.name }));
+          } catch { return []; }
+        }));
+        setAllStudents(lists.flat());
+      } finally {
+        setAllStudentsLoading(false);
+      }
+    };
+    if (classes && classes.length > 0) {
+      loadAll();
+    } else {
+      setAllStudents([]);
+    }
+  }, [classes]);
+
+  // Default the selected student to the first available if current selection is not in the list
+  useEffect(() => {
+    if (!allStudents || allStudents.length === 0) return;
+    if (!allStudents.some(s => s.student_id === studentId)) {
+      setStudentId(allStudents[0].student_id);
+    }
+  }, [allStudents]);
 
   const openClass = async (c) => {
     setActiveClass(c);
@@ -125,7 +160,7 @@ export default function App() {
       alert(`Ingested Paper ${res.paper_no} (${res.series}, ${res.tier}) with ${res.inserted} questions.`);
       setIngestUrl('');
       // refresh papers
-      try { setPapersLoading(true); const p = await listPapers('Edexcel'); setPapers(p||[]); } finally { setPapersLoading(false); }
+      try { setPapersLoading(true); const p = await listPapers('Edexcel'); setPapers(p || []); } finally { setPapersLoading(false); }
     } catch (e) {
       alert('Failed to ingest paper');
     } finally {
@@ -145,12 +180,23 @@ export default function App() {
 
   const handleAddStudent = async () => {
     if (!activeClass) return; if (!newStudentId.trim()) return;
-    try { await addStudentToClass(activeClass.id, newStudentId.trim(), newStudentName.trim() || undefined); setStudents([...(students || []), { id: Date.now(), student_id: newStudentId.trim(), name: newStudentName.trim(), class_id: activeClass.id }]); setNewStudentId(''); setNewStudentName(''); } catch { alert('Failed to add student'); }
+    try {
+      await addStudentToClass(activeClass.id, newStudentId.trim(), newStudentName.trim() || undefined);
+      const added = { id: Date.now(), student_id: newStudentId.trim(), name: newStudentName.trim(), class_id: activeClass.id };
+      setStudents([...(students || []), added]);
+      // Update all-students list with class name
+      setAllStudents(prev => [{ ...added, class_name: activeClass?.name }, ...(prev || [])]);
+      setNewStudentId(''); setNewStudentName('');
+    } catch { alert('Failed to add student'); }
   };
 
   const handleRemoveStudent = async (s) => {
     if (!activeClass) return;
-    try { await removeStudentFromClass(activeClass.id, s.student_id); setStudents((students || []).filter(x => x.student_id !== s.student_id)); } catch { }
+    try {
+      await removeStudentFromClass(activeClass.id, s.student_id);
+      setStudents((students || []).filter(x => x.student_id !== s.student_id));
+      setAllStudents((allStudents || []).filter(x => x.student_id !== s.student_id));
+    } catch { }
   };
 
   const handleUploadCSV = async (s, file) => {
@@ -248,13 +294,13 @@ export default function App() {
                     <div className="text-sm font-medium">Ingest Past Paper (MathsGenie URL)</div>
                   </div>
                   <div className="flex gap-2">
-                    <input className="border rounded px-3 py-2 flex-1" placeholder="https://www.mathsgenie.co.uk/papers/1fnov2023.pdf" value={ingestUrl} onChange={e=>setIngestUrl(e.target.value)} />
-                    <button className="px-3 py-2 rounded bg-emerald-600 text-white" onClick={handleIngest} disabled={ingesting}>{ingesting? 'Ingesting...' : 'Ingest'}</button>
+                    <input className="border rounded px-3 py-2 flex-1" placeholder="https://www.mathsgenie.co.uk/papers/1fnov2023.pdf" value={ingestUrl} onChange={e => setIngestUrl(e.target.value)} />
+                    <button className="px-3 py-2 rounded bg-emerald-600 text-white" onClick={handleIngest} disabled={ingesting}>{ingesting ? 'Ingesting...' : 'Ingest'}</button>
                   </div>
                   <div className="mt-2">
                     <div className="text-sm font-medium mb-1">Papers {papersLoading && <span className="text-gray-500">(loading...)</span>}</div>
                     <div className="space-y-2 max-h-64 overflow-auto">
-                      {(papers||[]).map(p => (
+                      {(papers || []).map(p => (
                         <div key={p.id} className="border rounded p-2 bg-white">
                           <div className="flex items-center justify-between">
                             <div className="text-sm">
@@ -262,15 +308,15 @@ export default function App() {
                             </div>
                             <div className="space-x-2">
                               <a href={p.pdf_url} target="_blank" rel="noreferrer" className="text-blue-600 underline text-sm">Open PDF</a>
-                                {p.markscheme_url ? (
-                                  <a href={p.markscheme_url} target="_blank" rel="noreferrer" className="text-blue-600 underline text-sm">Mark Scheme</a>
-                                ) : null}
-                              <button className="px-2 py-1 text-xs rounded border" onClick={()=>toggleQuestions(p)}>{selectedPaperId===p.id ? 'Hide Questions' : 'Show Questions'}</button>
+                              {p.markscheme_url ? (
+                                <a href={p.markscheme_url} target="_blank" rel="noreferrer" className="text-blue-600 underline text-sm">Mark Scheme</a>
+                              ) : null}
+                              <button className="px-2 py-1 text-xs rounded border" onClick={() => toggleQuestions(p)}>{selectedPaperId === p.id ? 'Hide Questions' : 'Show Questions'}</button>
                             </div>
                           </div>
-                          {selectedPaperId===p.id && (
+                          {selectedPaperId === p.id && (
                             <div className="mt-2 text-xs">
-                              {(paperQuestions||[]).length===0 ? (
+                              {(paperQuestions || []).length === 0 ? (
                                 <div className="text-gray-600">No questions or failed to load.</div>
                               ) : (
                                 <ul className="list-disc pl-5 space-y-1">
@@ -286,7 +332,7 @@ export default function App() {
                           )}
                         </div>
                       ))}
-                      {(!papers || papers.length===0) && <div className="text-sm text-gray-600">No papers yet.</div>}
+                      {(!papers || papers.length === 0) && <div className="text-sm text-gray-600">No papers yet.</div>}
                     </div>
                   </div>
                 </div>
@@ -429,7 +475,17 @@ export default function App() {
             </header>
             <h4 className="text-sm font-medium">Log an attempt</h4>
             <div className="grid grid-cols-1 gap-2">
-              <input className="border rounded px-3 py-2" value={studentId} onChange={e => setStudentId(e.target.value)} placeholder="Student ID" />
+              <select className="border rounded px-3 py-2"
+                value={studentId}
+                onChange={e => setStudentId(e.target.value)}>
+                {allStudentsLoading && <option>Loading students...</option>}
+                {(!allStudentsLoading && (!allStudents || allStudents.length === 0)) && <option value="">No students available</option>}
+                {allStudents.map(s => (
+                  <option key={s.student_id} value={s.student_id}>
+                    {s.student_id}{s.name ? ` - ${s.name}` : ''}{s.class_name ? ` (Class: ${s.class_name})` : ''}
+                  </option>
+                ))}
+              </select>
               <select className="border rounded px-3 py-2" value={selTopic} onChange={e => setSelTopic(e.target.value)}>
                 {topics.map(t => <option key={t.topic} value={t.topic}>{t.topic}</option>)}
               </select>
