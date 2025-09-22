@@ -262,6 +262,9 @@ export default function App() {
                             </div>
                             <div className="space-x-2">
                               <a href={p.pdf_url} target="_blank" rel="noreferrer" className="text-blue-600 underline text-sm">Open PDF</a>
+                                {p.markscheme_url ? (
+                                  <a href={p.markscheme_url} target="_blank" rel="noreferrer" className="text-blue-600 underline text-sm">Mark Scheme</a>
+                                ) : null}
                               <button className="px-2 py-1 text-xs rounded border" onClick={()=>toggleQuestions(p)}>{selectedPaperId===p.id ? 'Hide Questions' : 'Show Questions'}</button>
                             </div>
                           </div>
