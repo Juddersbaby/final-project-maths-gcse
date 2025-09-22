@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { getHealth, getTopics, postAttempt, getRecommendation, listClasses, createClass, deleteClass, listClassStudents, addStudentToClass, removeStudentFromClass, uploadStudentCSV, getClassCurriculum, updateClassCurriculum, listPapers, listQuestions, ingestPaper } from './api';
+import { getHealth, getTopics, postAttempt, getRecommendation, listClasses, createClass, deleteClass, listClassStudents, addStudentToClass, removeStudentFromClass, uploadStudentCSV, getClassCurriculum, updateClassCurriculum, listPapers, listQuestions, ingestPaper, listStudentAttempts } from './api';
 import ClassView from './components/ClassView';
 import StudentView from './components/StudentView';
 
@@ -38,6 +38,11 @@ export default function App() {
   const [ingesting, setIngesting] = useState(false);
   const [selectedPaperId, setSelectedPaperId] = useState(null);
   const [paperQuestions, setPaperQuestions] = useState([]);
+  // Student detail
+  const [detailStudent, setDetailStudent] = useState(null);
+  const [detailAttempts, setDetailAttempts] = useState([]);
+  const [detailRecs, setDetailRecs] = useState([]);
+  const [detailLoading, setDetailLoading] = useState(false);
 
   useEffect(() => {
     getHealth().then(setStatus).catch(() => setStatus({ ok: false }));
@@ -206,6 +211,23 @@ export default function App() {
       setStudents((students || []).filter(x => x.student_id !== s.student_id));
       setAllStudents((allStudents || []).filter(x => x.student_id !== s.student_id));
     } catch { }
+  };
+
+  const openStudentDetail = async (s) => {
+    setDetailStudent(s);
+    setView('studentDetail');
+    setDetailAttempts([]); setDetailRecs([]);
+    try {
+      setDetailLoading(true);
+      const [atts, recs] = await Promise.all([
+        listStudentAttempts(s.student_id, 100),
+        getRecommendation(s.student_id, 3, policy)
+      ]);
+      setDetailAttempts(atts || []);
+      setDetailRecs(recs?.next_topics || []);
+    } catch {
+      setDetailAttempts([]); setDetailRecs([]);
+    } finally { setDetailLoading(false); }
   };
 
   const handleUploadCSV = async (s, file) => {
@@ -452,6 +474,7 @@ export default function App() {
                       <div className="text-xs text-gray-500">Class: {activeClass?.name}</div>
                     </div>
                     <div className="space-x-2">
+                      <button className="px-3 py-1 bg-blue-600 text-white rounded" onClick={() => openStudentDetail(s)}>View</button>
                       <label className="px-3 py-1 border rounded cursor-pointer">
                         <input type="file" accept=".csv" className="hidden" onChange={e => handleUploadCSV(s, e.target.files[0])} />
                         {csvUploading ? 'Uploading...' : 'Upload CSV'}
@@ -469,6 +492,48 @@ export default function App() {
                   </div>
                 ))}
                 {(!students || students.length === 0) && <div className="text-sm text-gray-600">No students yet.</div>}
+              </div>
+            </div>
+          )}
+
+          {view === 'studentDetail' && (
+            <div className="bg-white rounded-2xl shadow p-6 space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="text-xl font-semibold">{detailStudent?.student_id}{detailStudent?.name ? ` - ${detailStudent.name}` : ''}</h3>
+                  <div className="text-sm text-gray-600">Class: {activeClass?.name}</div>
+                </div>
+                <div>
+                  <button onClick={() => setView('students')} className="px-3 py-1 rounded border">Back</button>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="border rounded p-4">
+                  <h4 className="font-medium mb-2">Results</h4>
+                  {detailLoading && <div className="text-sm text-gray-600">Loading...</div>}
+                  {(!detailLoading && (!detailAttempts || detailAttempts.length===0)) && <div className="text-sm text-gray-600">No attempts yet.</div>}
+                  {detailAttempts && detailAttempts.length>0 && (
+                    <ul className="text-sm divide-y">
+                      {detailAttempts.map((a, i) => (
+                        <li key={i} className="py-1 flex items-center justify-between">
+                          <span>{a.ts?.slice(0,19).replace('T',' ')} — {a.topic} — Diff {a.difficulty}</span>
+                          <span className={a.correct ? 'text-emerald-600' : 'text-red-600'}>{a.correct ? 'Correct' : 'Incorrect'}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+                <div className="border rounded p-4">
+                  <h4 className="font-medium mb-2">Recommendations</h4>
+                  {detailLoading && <div className="text-sm text-gray-600">Loading...</div>}
+                  {(!detailLoading && (!detailRecs || detailRecs.length===0)) && <div className="text-sm text-gray-600">No recommendations.</div>}
+                  {detailRecs && detailRecs.length>0 && (
+                    <ul className="list-disc pl-5 text-sm">
+                      {detailRecs.map((r, i) => <li key={i}>{r}</li>)}
+                    </ul>
+                  )}
+                </div>
               </div>
             </div>
           )}

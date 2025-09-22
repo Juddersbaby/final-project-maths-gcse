@@ -467,6 +467,23 @@ def remove_student_from_class(class_id: int, student_id: str):
     conn.commit(); conn.close()
     return {"ok": True}
 
+@app.get("/students/{student_id}/attempts")
+def list_student_attempts(student_id: str, limit: int = Query(50, ge=1, le=1000)):
+    try:
+        conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row; cur = conn.cursor()
+        cur.execute("""
+            SELECT topic, difficulty, correct, ts
+            FROM attempts
+            WHERE student_id = ?
+            ORDER BY ts DESC
+            LIMIT ?
+        """, (student_id, limit))
+        out = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return out
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load attempts: {e}")
+
 @app.post("/students/{student_id}/upload_csv")
 async def upload_student_csv(student_id: str, file: UploadFile = File(...)):
     # Expect CSV with columns: topic, difficulty, correct, ts(optional)

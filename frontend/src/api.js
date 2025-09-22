@@ -38,3 +38,8 @@ export async function listQuestions(paper_id) {
 export async function ingestPaper(url, board = 'Edexcel', markscheme_url = null) {
   return axios.post(`${API_BASE}/ingest_paper`, { url, board, markscheme_url }).then(r => r.data);
 }
+
+// Student attempts
+export async function listStudentAttempts(studentId, limit = 50) {
+  return axios.get(`${API_BASE}/students/${encodeURIComponent(studentId)}/attempts`, { params: { limit } }).then(r => r.data);
+}
