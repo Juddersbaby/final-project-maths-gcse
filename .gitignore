@@ -11,5 +11,8 @@ app.db
 # Node
 node_modules/
 
+# Frontend build output
+frontend/build/
+
 # Logs
 *.log

@@ -1,4 +1,5 @@
 ﻿from fastapi import FastAPI, HTTPException, Query
+from fastapi import UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional
@@ -10,6 +11,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from fastapi import Query
+import requests, io, pdfplumber
 import json
 import logging, traceback
 logger = logging.getLogger("uvicorn.error")
@@ -129,6 +131,37 @@ init_db()
 
 def migrate_schema():
     conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+    # Ensure classes and students tables exist
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS classes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            created_at TEXT,
+            curriculum TEXT
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS students (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id TEXT NOT NULL UNIQUE,
+            name TEXT,
+            class_id INTEGER,
+            created_at TEXT,
+            FOREIGN KEY(class_id) REFERENCES classes(id)
+        )
+        """
+    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_students_class_id ON students(class_id)")
+    # Ensure curriculum column exists on existing DBs
+    try:
+        _c_cols = [r[1] for r in cur.execute("PRAGMA table_info(classes)").fetchall()]
+        if "curriculum" not in _c_cols:
+            cur.execute("ALTER TABLE classes ADD COLUMN curriculum TEXT")
+    except Exception:
+        pass
     # Ensure questions has open_url and text_snippet
     cols = [r[1] for r in cur.execute("PRAGMA table_info(questions)").fetchall()]
     if "open_url" not in cols:
@@ -196,6 +229,14 @@ class RecommendationOut(BaseModel):
     student_id: str
     next_topics: List[str]
 
+class ClassIn(BaseModel):
+    name: str = Field(min_length=1)
+    curriculum: Optional[List[str]] = None
+
+class StudentIn(BaseModel):
+    student_id: str = Field(min_length=1)
+    name: Optional[str] = None
+
 @app.get("/health")
 def health():
     return {"ok": True, "version": "0.3.0"}
@@ -233,6 +274,85 @@ def list_questions(paper_id: int = Query(..., description="papers.id to fetch"))
         r["open_url"] = f"{base}#page={r['page_start']}"
     return out
 
+# ---------- Paper ingestion (from PDF URL) ----------
+class IngestIn(BaseModel):
+    url: str
+    board: Optional[str] = "Edexcel"
+    markscheme_url: Optional[str] = None
+
+@app.post("/ingest_paper")
+def ingest_paper(payload: IngestIn):
+    try:
+        # Lazy import to avoid circulars if any
+        from backend import ingest_paper as ing
+    except Exception:
+        raise HTTPException(status_code=500, detail="Ingest module not available")
+
+    meta = ing.parse_series_from_url(payload.url)
+    if not meta:
+        raise HTTPException(status_code=400, detail="Could not parse tier/series/paper from URL. Expected /<num><f|h><month><year>.pdf")
+    paper_no, tier, series, calculator, year = meta
+
+    # Download PDF
+    try:
+        r = requests.get(payload.url, timeout=60)
+        r.raise_for_status()
+        pdf_bytes = r.content
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch PDF: {e}")
+
+    ranges = ing.extract_questions(pdf_bytes)
+    if not ranges:
+        raise HTTPException(status_code=422, detail="No question markers found in PDF (image-only or unknown format)")
+
+    # Insert into DB
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        ing.ensure_schema(conn)
+        paper_id = ing.add_paper(conn, payload.board or "Edexcel", tier, series, paper_no, calculator, year, payload.url, payload.markscheme_url)
+
+        # Extract snippets and insert questions
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            cur = conn.cursor()
+            inserted = 0
+            for (qno, marks, ps, pe) in ranges:
+                pages_text = []
+                for p in range(ps, pe+1):
+                    pages_text.append(pdf.pages[p-1].extract_text() or "")
+                raw = " ".join(pages_text)
+                snippet = ing.compact(ing.clean_text(raw))
+                topic = ing.guess_topic(snippet)
+                diff = 1 if marks <= 2 else (2 if marks <= 4 else 3)
+                cur.execute(
+                    """
+                    INSERT OR REPLACE INTO questions
+                    (paper_id,qno,marks,page_start,page_end,topic,difficulty,text_snippet)
+                    VALUES(?,?,?,?,?,?,?,?)
+                    """,
+                    (paper_id, qno, marks, ps, pe, topic, diff, snippet)
+                )
+                inserted += 1
+            conn.commit()
+    finally:
+        conn.close()
+
+    # Rebuild TF-IDF index for questions
+    try:
+        build_tfidf_questions()
+    except Exception:
+        MODELS['tfidf'] = None
+
+    return {
+        "ok": True,
+        "paper_id": paper_id,
+        "series": series,
+        "tier": tier,
+        "paper_no": paper_no,
+        "calculator": calculator,
+        "year": year,
+        "inserted": len(ranges)
+    }
+
 # ---------- Attempts & Recommenders  ----------
 @app.post("/attempt")
 def post_attempt(a: AttemptIn):
@@ -247,6 +367,166 @@ def post_attempt(a: AttemptIn):
     conn.commit(); conn.close()
     MODELS["dirty"] = True
     return {"ok": True}
+
+# ---------- Classes & Students (lightweight CRUD) ----------
+@app.get("/classes")
+def list_classes():
+    conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row; cur = conn.cursor()
+    cur.execute("SELECT c.id, c.name, c.curriculum, COALESCE(cnt.cnt,0) AS student_count FROM classes c LEFT JOIN (SELECT class_id, COUNT(1) AS cnt FROM students GROUP BY class_id) cnt ON c.id = cnt.class_id ORDER BY c.name")
+    rows = [dict(r) for r in cur.fetchall()]
+    for r in rows:
+        curj = r.get("curriculum")
+        if curj:
+            try:
+                r["curriculum"] = json.loads(curj) or []
+            except Exception:
+                r["curriculum"] = []
+        else:
+            r["curriculum"] = []
+    conn.close()
+    return rows
+
+@app.post("/classes")
+def create_class(payload: ClassIn):
+    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+    try:
+        ts = datetime.datetime.utcnow().isoformat()
+        weeks = None
+        if payload.curriculum is not None:
+            weeks = [str(x) for x in list(payload.curriculum)][:25]
+        cur.execute("INSERT INTO classes(name, created_at, curriculum) VALUES(?, ?, ?)", (payload.name.strip(), ts, json.dumps(weeks) if weeks is not None else None))
+        cid = cur.lastrowid
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        raise HTTPException(status_code=409, detail="Class already exists")
+    conn.close()
+    return {"id": cid, "name": payload.name, "curriculum": weeks or []}
+
+@app.delete("/classes/{class_id}")
+def delete_class(class_id: int):
+    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+    # Detach students first (keep their identity and attempts)
+    cur.execute("UPDATE students SET class_id = NULL WHERE class_id = ?", (class_id,))
+    cur.execute("DELETE FROM classes WHERE id = ?", (class_id,))
+    conn.commit(); conn.close()
+    return {"ok": True}
+
+class CurriculumIn(BaseModel):
+    weeks: List[str]
+
+@app.get("/classes/{class_id}/curriculum")
+def get_class_curriculum(class_id: int):
+    conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row; cur = conn.cursor()
+    cur.execute("SELECT curriculum FROM classes WHERE id=?", (class_id,))
+    row = cur.fetchone(); conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Class not found")
+    try:
+        weeks = json.loads(row["curriculum"]) if row["curriculum"] else []
+    except Exception:
+        weeks = []
+    return {"id": class_id, "weeks": weeks}
+
+@app.put("/classes/{class_id}/curriculum")
+def update_class_curriculum(class_id: int, payload: CurriculumIn):
+    weeks = [str(x) for x in (payload.weeks or [])][:25]
+    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+    cur.execute("UPDATE classes SET curriculum=? WHERE id=?", (json.dumps(weeks), class_id))
+    if cur.rowcount == 0:
+        conn.close(); raise HTTPException(status_code=404, detail="Class not found")
+    conn.commit(); conn.close()
+    return {"ok": True, "id": class_id, "weeks": weeks}
+
+@app.get("/classes/{class_id}/students")
+def list_class_students(class_id: int):
+    conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row; cur = conn.cursor()
+    cur.execute("SELECT id, student_id, name, class_id, created_at FROM students WHERE class_id = ? ORDER BY student_id", (class_id,))
+    out = [dict(r) for r in cur.fetchall()]
+    conn.close(); return out
+
+@app.post("/classes/{class_id}/students")
+def add_student_to_class(class_id: int, payload: StudentIn):
+    sid = payload.student_id.strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="student_id required")
+    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+    ts = datetime.datetime.utcnow().isoformat()
+    # Upsert-like: try insert; if exists, update class_id and name
+    try:
+        cur.execute("INSERT INTO students(student_id, name, class_id, created_at) VALUES(?, ?, ?, ?)", (sid, payload.name, class_id, ts))
+    except sqlite3.IntegrityError:
+        cur.execute("UPDATE students SET class_id = ?, name = COALESCE(?, name) WHERE student_id = ?", (class_id, payload.name, sid))
+    conn.commit(); conn.close()
+    return {"ok": True, "student_id": sid, "class_id": class_id}
+
+@app.delete("/classes/{class_id}/students/{student_id}")
+def remove_student_from_class(class_id: int, student_id: str):
+    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+    cur.execute("UPDATE students SET class_id = NULL WHERE class_id = ? AND student_id = ?", (class_id, student_id))
+    conn.commit(); conn.close()
+    return {"ok": True}
+
+@app.get("/students/{student_id}/attempts")
+def list_student_attempts(student_id: str, limit: int = Query(50, ge=1, le=1000)):
+    try:
+        conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row; cur = conn.cursor()
+        cur.execute("""
+            SELECT topic, difficulty, correct, ts
+            FROM attempts
+            WHERE student_id = ?
+            ORDER BY ts DESC
+            LIMIT ?
+        """, (student_id, limit))
+        out = [dict(r) for r in cur.fetchall()]
+        conn.close()
+        return out
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load attempts: {e}")
+
+@app.post("/students/{student_id}/upload_csv")
+async def upload_student_csv(student_id: str, file: UploadFile = File(...)):
+    # Expect CSV with columns: topic, difficulty, correct, ts(optional)
+    content = await file.read()
+    try:
+        from io import StringIO
+        buf = StringIO(content.decode('utf-8', errors='ignore'))
+        df = pd.read_csv(buf)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid CSV: {e}")
+
+    required = {"topic", "difficulty", "correct"}
+    if not required.issubset(set(map(str.lower, df.columns))):
+        # try case-insensitive mapping
+        cols_map = {c.lower(): c for c in df.columns}
+        if not required.issubset(cols_map.keys()):
+            raise HTTPException(status_code=400, detail="CSV must have columns: topic, difficulty, correct, [ts]")
+        df = df.rename(columns={cols_map.get("topic"): "topic", cols_map.get("difficulty"): "difficulty", cols_map.get("correct"): "correct", cols_map.get("ts"): "ts" if cols_map.get("ts") else None})
+
+    # Normalize and validate
+    df["topic"] = df["topic"].astype(str)
+    df["difficulty"] = pd.to_numeric(df["difficulty"], errors="coerce").fillna(2).clip(1,3).astype(int)
+    df["correct"] = pd.to_numeric(df["correct"], errors="coerce").fillna(0).clip(0,1).astype(int)
+    if "ts" in df.columns:
+        df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+    else:
+        df["ts"] = pd.NaT
+
+    # Filter to known topics and cap rows
+    df = df[df["topic"].isin(TOPICS)].head(5000)
+    if df.empty:
+        return {"ok": True, "inserted": 0}
+
+    conn = sqlite3.connect(DB_PATH); cur = conn.cursor()
+    now_iso = datetime.datetime.utcnow().isoformat()
+    rows = []
+    for _, r in df.iterrows():
+        ts = r["ts"].isoformat() if pd.notna(r["ts"]) else now_iso
+        rows.append((student_id.strip(), r["topic"], int(r["difficulty"]), int(r["correct"]), ts))
+    cur.executemany("INSERT INTO attempts(student_id, topic, difficulty, correct, ts) VALUES (?, ?, ?, ?, ?)", rows)
+    conn.commit(); conn.close()
+    MODELS["dirty"] = True
+    return {"ok": True, "inserted": len(rows)}
 
 def load_df():
     conn = sqlite3.connect(DB_PATH)
@@ -508,7 +788,8 @@ def recommend_questions(student_id: str = Query(...), k: int = Query(5, ge=1, le
 
     qdf = get_questions_df()
     if qdf.empty:
-        raise HTTPException(status_code=404, detail="No questions in database. Ingest a paper first.")
+        # Return empty list rather than 404 so callers/tests can handle gracefully
+        return {"policy": policy, "student_id": student_id, "k": k, "topics_used": topics, "items": [], "questions": []}
 
     cand_df = qdf[qdf["topic"].isin(topics)].copy()
     if cand_df.empty:
@@ -517,20 +798,19 @@ def recommend_questions(student_id: str = Query(...), k: int = Query(5, ge=1, le
     # 2) try TF-IDF ranking if available, else ignore any TF-IDF errors and fall back
     ranked_ids = []
     try:
-        tf = ensure_tfidf()  # may not exist or may be None
+        ensure_tfidf()
+        tf = MODELS.get('tfidf')
         if tf:
             from sklearn.metrics.pairwise import cosine_similarity
-            # build very simple user vector = sum of topic centroids we have
-            def topic_tfidf_centroids():
-                X = tf["X"]; df_all = tf["qdf"]
-                cents = {}
-                for t in df_all["topic"].dropna().unique():
-                    idx = np.where(df_all["topic"].values == t)[0]
-                    if len(idx) > 0:
-                        cents[t] = X[idx].mean(axis=0)
-                return cents
-
-            cents = topic_tfidf_centroids()
+            X = tf["X"]; tf_ids = tf["ids"]; tf_topics = tf["topics"]
+            # Build topic centroids in TF-IDF space
+            cents = {}
+            topics_arr = np.array(tf_topics, dtype=object)
+            for t in pd.Series(topics_arr).dropna().unique():
+                idx = np.where(topics_arr == t)[0]
+                if len(idx) > 0:
+                    cents[t] = X[idx].mean(axis=0)
+            # User vector = sum of chosen topic centroids
             user_vec = None; cnt = 0
             for t in topics:
                 c = cents.get(t)
@@ -538,12 +818,15 @@ def recommend_questions(student_id: str = Query(...), k: int = Query(5, ge=1, le
                     user_vec = c if user_vec is None else (user_vec + c)
                     cnt += 1
             if user_vec is not None and cnt > 0:
-                sims = cosine_similarity(user_vec, tf["X"]).ravel()
-                # restrict to candidate topic questions
-                mask = np.zeros(len(tf["qdf"]), dtype=bool)
-                mask[cand_df.index.values] = True
-                rank_all = np.argsort(sims)[::-1]
-                ranked_ids = tf["qdf"].iloc[rank_all][mask[rank_all]]["id"].tolist()
+                sims = cosine_similarity(user_vec, X)
+                sims = np.asarray(sims).ravel()
+                cand_ids = set(int(x) for x in cand_df["id"].values.tolist())
+                for idx in np.argsort(sims)[::-1]:
+                    qid = int(tf_ids[idx])
+                    if qid in cand_ids:
+                        ranked_ids.append(qid)
+                        if len(ranked_ids) >= k*3:
+                            break
     except Exception:
         ranked_ids = []  # ignore TF-IDF issues and fall back
 
@@ -617,7 +900,7 @@ def recommend_questions(student_id: str = Query(...), k: int = Query(5, ge=1, le
     except Exception:
         pass
 
-    return {"policy": policy, "student_id": student_id, "k": k, "topics_used": topics, "items": out_rows}
+    return {"policy": policy, "student_id": student_id, "k": k, "topics_used": topics, "items": out_rows, "questions": out_rows}
 
 
 @app.post("/train")
