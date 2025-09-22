@@ -1,0 +1,66 @@
+%% ER diagram for the SQLite schema
+%% Source tables and relations extracted from backend/main.py and backend/ingest_paper.py
+
+erDiagram
+    CLASSES ||--o{ STUDENTS : includes
+    STUDENTS ||--o{ ATTEMPTS : logs
+    PAPERS ||--o{ QUESTIONS : contains
+    STUDENTS ||--o{ AB_LOG : served
+
+    CLASSES {
+      id INTEGER PK
+      name TEXT
+      created_at TEXT
+      curriculum TEXT
+    }
+
+    STUDENTS {
+      id INTEGER PK
+      student_id TEXT
+      name TEXT
+      class_id INTEGER
+      created_at TEXT
+    }
+
+    ATTEMPTS {
+      id INTEGER PK
+      student_id TEXT
+      topic TEXT
+      difficulty INTEGER
+      correct INTEGER
+      ts TEXT
+    }
+
+    PAPERS {
+      id INTEGER PK
+      board TEXT
+      tier TEXT
+      series TEXT
+      paper_no INTEGER
+      calculator INTEGER
+      year INTEGER
+      pdf_url TEXT
+      markscheme_url TEXT
+    }
+
+    QUESTIONS {
+      id INTEGER PK
+      paper_id INTEGER
+      qno INTEGER
+      marks INTEGER
+      page_start INTEGER
+      page_end INTEGER
+      topic TEXT
+      difficulty INTEGER
+      open_url TEXT
+      text_snippet TEXT
+    }
+
+    AB_LOG {
+      id INTEGER PK
+      student_id TEXT
+      policy TEXT
+      k INTEGER
+      payload TEXT
+      ts TEXT
+    }
