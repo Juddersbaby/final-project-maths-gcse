@@ -30,6 +30,7 @@ export default function App() {
   // All students (for Control Panel dropdown)
   const [allStudents, setAllStudents] = useState([]);
   const [allStudentsLoading, setAllStudentsLoading] = useState(false);
+  const [studentFilter, setStudentFilter] = useState('');
   // Papers & ingestion
   const [papers, setPapers] = useState([]);
   const [papersLoading, setPapersLoading] = useState(false);
@@ -84,6 +85,14 @@ export default function App() {
       setStudentId(allStudents[0].student_id);
     }
   }, [allStudents]);
+
+  const filteredStudents = React.useMemo(() => {
+    const q = (studentFilter || '').toLowerCase();
+    if (!q) return allStudents || [];
+    return (allStudents || []).filter(s => (
+      `${s.student_id} ${s.name || ''} ${s.class_name || ''}`.toLowerCase().includes(q)
+    ));
+  }, [allStudents, studentFilter]);
 
   const openClass = async (c) => {
     setActiveClass(c);
@@ -475,12 +484,14 @@ export default function App() {
             </header>
             <h4 className="text-sm font-medium">Log an attempt</h4>
             <div className="grid grid-cols-1 gap-2">
+              <input className="border rounded px-3 py-2" placeholder="Filter students (ID, name, class)" value={studentFilter} onChange={e=>setStudentFilter(e.target.value)} />
               <select className="border rounded px-3 py-2"
                 value={studentId}
                 onChange={e => setStudentId(e.target.value)}>
                 {allStudentsLoading && <option>Loading students...</option>}
                 {(!allStudentsLoading && (!allStudents || allStudents.length === 0)) && <option value="">No students available</option>}
-                {allStudents.map(s => (
+                {(!allStudentsLoading && allStudents && allStudents.length > 0 && filteredStudents.length === 0) && <option value="">No matches</option>}
+                {filteredStudents.map(s => (
                   <option key={s.student_id} value={s.student_id}>
                     {s.student_id}{s.name ? ` - ${s.name}` : ''}{s.class_name ? ` (Class: ${s.class_name})` : ''}
                   </option>
