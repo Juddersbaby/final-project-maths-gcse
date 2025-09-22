@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { getHealth, getTopics, postAttempt, getRecommendation, listClasses, createClass, deleteClass, listClassStudents, addStudentToClass, removeStudentFromClass, uploadStudentCSV } from './api';
+import { getHealth, getTopics, postAttempt, getRecommendation, listClasses, createClass, deleteClass, listClassStudents, addStudentToClass, removeStudentFromClass, uploadStudentCSV, getClassCurriculum, updateClassCurriculum } from './api';
 import ClassView from './components/ClassView';
 import StudentView from './components/StudentView';
 
@@ -23,6 +23,10 @@ export default function App() {
   const [newStudentId, setNewStudentId] = useState('');
   const [newStudentName, setNewStudentName] = useState('');
   const [csvUploading, setCsvUploading] = useState(false);
+  // Curriculum (view + edit) for active class
+  const [currentCurriculum, setCurrentCurriculum] = useState([]); // read-only display of weeks
+  const [editWeeks, setEditWeeks] = useState(['']); // editable weeks state
+  const [savingCurr, setSavingCurr] = useState(false);
 
   useEffect(() => {
     getHealth().then(setStatus).catch(() => setStatus({ ok: false }));
@@ -35,6 +39,17 @@ export default function App() {
     setActiveClass(c);
     setView('students');
     try { setStudents(await listClassStudents(c.id)); } catch { }
+    // Load curriculum for this class
+    try {
+      const cur = await getClassCurriculum(c.id);
+      const weeks = (cur?.weeks || []).slice(0, 25);
+      setCurrentCurriculum(weeks);
+      // Ensure at least Week 1 slot for editing
+      setEditWeeks(weeks.length > 0 ? weeks : ['']);
+    } catch {
+      setCurrentCurriculum([]);
+      setEditWeeks(['']);
+    }
   };
 
   const handleCreateClass = async () => {
@@ -54,6 +69,36 @@ export default function App() {
   const handleDeleteClass = async (cls) => {
     if (!window.confirm(`Delete class "${cls.name}"?`)) return;
     try { await deleteClass(cls.id); setClasses((classes || []).filter(x => x.id !== cls.id)); if (activeClass?.id === cls.id) { setActiveClass(null); setStudents([]); setView('class'); } } catch { }
+  };
+
+  // Curriculum editing handlers
+  const handleCurriculumAddWeek = () => {
+    if (editWeeks.length < 25) setEditWeeks([...editWeeks, '']);
+  };
+  const handleCurriculumRemoveLast = () => {
+    if (editWeeks.length > 1) setEditWeeks(editWeeks.slice(0, -1));
+  };
+  const handleCurriculumSave = async () => {
+    if (!activeClass) return;
+    // Require Week 1
+    if (!editWeeks[0] || !editWeeks[0].trim()) { alert('Please select a topic for Week 1'); return; }
+    try {
+      setSavingCurr(true);
+      const weeks = editWeeks.map(w => (w && w.trim()) ? w.trim() : '').slice(0, 25);
+      await updateClassCurriculum(activeClass.id, weeks);
+      setCurrentCurriculum(weeks);
+      // Normalize edit state to saved weeks
+      setEditWeeks(weeks.length > 0 ? weeks : ['']);
+    } catch (e) {
+      alert('Failed to save curriculum');
+    } finally {
+      setSavingCurr(false);
+    }
+  };
+  const handleCurriculumCancel = () => {
+    // Restore edit form to current curriculum (or Week 1 blank)
+    const weeks = (currentCurriculum || []).slice(0, 25);
+    setEditWeeks(weeks.length > 0 ? weeks : ['']);
   };
 
   const handleAddStudent = async () => {
@@ -138,7 +183,7 @@ export default function App() {
                     {curriculumWeeks.map((val, idx) => (
                       <div key={idx} className="flex items-center gap-2">
                         <label className="w-20 text-xs text-gray-600">Week {idx + 1}</label>
-                        <select className={`border rounded px-2 py-1 flex-1 ${idx===0 && (!val||!val.trim()) ? 'border-red-500' : ''}`}
+                        <select className={`border rounded px-2 py-1 flex-1 ${idx === 0 && (!val || !val.trim()) ? 'border-red-500' : ''}`}
                           value={val}
                           onChange={e => {
                             const copy = [...curriculumWeeks];
@@ -188,6 +233,65 @@ export default function App() {
                 </div>
               </div>
 
+              {/* Current Curriculum */}
+              <div className="border rounded p-4 bg-gray-50 space-y-2">
+                <div className="flex items-center justify-between">
+                  <h4 className="font-medium">Current Curriculum</h4>
+                </div>
+                {currentCurriculum && currentCurriculum.filter(w => w && w.trim()).length > 0 ? (
+                  <ul className="text-sm list-disc pl-5">
+                    {currentCurriculum.map((w, i) => (
+                      w && w.trim() ? <li key={i}>Week {i + 1}: {w}</li> : null
+                    ))}
+                  </ul>
+                ) : (
+                  <div className="text-sm text-gray-600">No curriculum set yet.</div>
+                )}
+              </div>
+
+              {/* Edit Curriculum */}
+              <div className="border rounded p-4 space-y-3">
+                <div className="flex items-center justify-between">
+                  <h4 className="font-medium">Edit Curriculum</h4>
+                  <div className="space-x-2">
+                    <button type="button" className="px-2 py-1 text-sm rounded border" onClick={handleCurriculumAddWeek}>+ Week</button>
+                    <button type="button" className="px-2 py-1 text-sm rounded border" onClick={handleCurriculumRemoveLast}>Remove last</button>
+                  </div>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
+                  {editWeeks.map((val, idx) => (
+                    <div key={idx} className="flex items-center gap-2">
+                      <label className="w-20 text-xs text-gray-600">Week {idx + 1}</label>
+                      <select className={`border rounded px-2 py-1 flex-1 ${idx === 0 && (!val || !val.trim()) ? 'border-red-500' : ''}`}
+                        value={val}
+                        onChange={e => {
+                          const copy = [...editWeeks];
+                          copy[idx] = e.target.value;
+                          setEditWeeks(copy);
+                        }}>
+                        <option value="">-- Select Topic --</option>
+                        {topics.map(t => (
+                          <option key={t.topic} value={t.topic}>{t.topic}</option>
+                        ))}
+                      </select>
+                    </div>
+                  ))}
+                </div>
+                <div className="flex gap-2">
+                  {(() => {
+                    const norm = (arr) => JSON.stringify((arr || []).map(w => (w && w.trim()) ? w.trim() : ''));
+                    const changed = norm(editWeeks) !== norm(currentCurriculum);
+                    const invalid = !editWeeks[0] || !editWeeks[0].trim();
+                    return (
+                      <>
+                        <button onClick={handleCurriculumSave} disabled={!changed || invalid || savingCurr} className={`px-3 py-2 rounded ${(!changed || invalid || savingCurr) ? 'bg-gray-300 text-gray-600' : 'bg-emerald-600 text-white'}`}>{savingCurr ? 'Saving...' : 'Save'}</button>
+                        <button onClick={handleCurriculumCancel} className="px-3 py-2 rounded border">Cancel</button>
+                      </>
+                    );
+                  })()}
+                </div>
+              </div>
+
               <div className="flex gap-2">
                 <input className="border rounded px-3 py-2" placeholder="Student ID" value={newStudentId} onChange={e => setNewStudentId(e.target.value)} />
                 <input className="border rounded px-3 py-2 flex-1" placeholder="Name (optional)" value={newStudentName} onChange={e => setNewStudentName(e.target.value)} />
@@ -206,13 +310,13 @@ export default function App() {
                         <input type="file" accept=".csv" className="hidden" onChange={e => handleUploadCSV(s, e.target.files[0])} />
                         {csvUploading ? 'Uploading...' : 'Upload CSV'}
                       </label>
-                      <button className="px-3 py-1 border rounded" onClick={async ()=>{
+                      <button className="px-3 py-1 border rounded" onClick={async () => {
                         try {
                           const resp = await fetch('/sample_student_results.csv');
                           const blob = await resp.blob();
                           const file = new File([blob], 'sample_student_results.csv', { type: 'text/csv' });
                           await handleUploadCSV(s, file);
-                        } catch {}
+                        } catch { }
                       }}>Demo Upload</button>
                       <button className="px-3 py-1 border rounded" onClick={() => handleRemoveStudent(s)}>Remove</button>
                     </div>
