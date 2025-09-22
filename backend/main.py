@@ -644,7 +644,8 @@ def recommend_questions(student_id: str = Query(...), k: int = Query(5, ge=1, le
 
     qdf = get_questions_df()
     if qdf.empty:
-        raise HTTPException(status_code=404, detail="No questions in database. Ingest a paper first.")
+        # Return empty list rather than 404 so callers/tests can handle gracefully
+        return {"policy": policy, "student_id": student_id, "k": k, "topics_used": topics, "items": [], "questions": []}
 
     cand_df = qdf[qdf["topic"].isin(topics)].copy()
     if cand_df.empty:
@@ -653,20 +654,19 @@ def recommend_questions(student_id: str = Query(...), k: int = Query(5, ge=1, le
     # 2) try TF-IDF ranking if available, else ignore any TF-IDF errors and fall back
     ranked_ids = []
     try:
-        tf = ensure_tfidf()  # may not exist or may be None
+        ensure_tfidf()
+        tf = MODELS.get('tfidf')
         if tf:
             from sklearn.metrics.pairwise import cosine_similarity
-            # build very simple user vector = sum of topic centroids we have
-            def topic_tfidf_centroids():
-                X = tf["X"]; df_all = tf["qdf"]
-                cents = {}
-                for t in df_all["topic"].dropna().unique():
-                    idx = np.where(df_all["topic"].values == t)[0]
-                    if len(idx) > 0:
-                        cents[t] = X[idx].mean(axis=0)
-                return cents
-
-            cents = topic_tfidf_centroids()
+            X = tf["X"]; tf_ids = tf["ids"]; tf_topics = tf["topics"]
+            # Build topic centroids in TF-IDF space
+            cents = {}
+            topics_arr = np.array(tf_topics, dtype=object)
+            for t in pd.Series(topics_arr).dropna().unique():
+                idx = np.where(topics_arr == t)[0]
+                if len(idx) > 0:
+                    cents[t] = X[idx].mean(axis=0)
+            # User vector = sum of chosen topic centroids
             user_vec = None; cnt = 0
             for t in topics:
                 c = cents.get(t)
@@ -674,12 +674,15 @@ def recommend_questions(student_id: str = Query(...), k: int = Query(5, ge=1, le
                     user_vec = c if user_vec is None else (user_vec + c)
                     cnt += 1
             if user_vec is not None and cnt > 0:
-                sims = cosine_similarity(user_vec, tf["X"]).ravel()
-                # restrict to candidate topic questions
-                mask = np.zeros(len(tf["qdf"]), dtype=bool)
-                mask[cand_df.index.values] = True
-                rank_all = np.argsort(sims)[::-1]
-                ranked_ids = tf["qdf"].iloc[rank_all][mask[rank_all]]["id"].tolist()
+                sims = cosine_similarity(user_vec, X)
+                sims = np.asarray(sims).ravel()
+                cand_ids = set(int(x) for x in cand_df["id"].values.tolist())
+                for idx in np.argsort(sims)[::-1]:
+                    qid = int(tf_ids[idx])
+                    if qid in cand_ids:
+                        ranked_ids.append(qid)
+                        if len(ranked_ids) >= k*3:
+                            break
     except Exception:
         ranked_ids = []  # ignore TF-IDF issues and fall back
 
@@ -753,7 +756,7 @@ def recommend_questions(student_id: str = Query(...), k: int = Query(5, ge=1, le
     except Exception:
         pass
 
-    return {"policy": policy, "student_id": student_id, "k": k, "topics_used": topics, "items": out_rows}
+    return {"policy": policy, "student_id": student_id, "k": k, "topics_used": topics, "items": out_rows, "questions": out_rows}
 
 
 @app.post("/train")
